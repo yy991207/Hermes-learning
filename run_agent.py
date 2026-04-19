@@ -2,18 +2,17 @@
 """
 AI Agent Runner with Tool Calling
 
-This module provides a clean, standalone agent that can execute AI models
-with tool calling capabilities. It handles the conversation loop, tool execution,
-and response management.
+本模块提供了一个简洁、独立的代理，可以执行具有工具调用能力的AI模型。
+它处理对话循环、工具执行和响应管理。
 
-Features:
-- Automatic tool calling loop until completion
-- Configurable model parameters
-- Error handling and recovery
-- Message history management
-- Support for multiple model providers
+功能特性：
+- 自动工具调用循环直至完成
+- 可配置的模型参数
+- 错误处理和恢复
+- 消息历史管理
+- 支持多个模型提供商
 
-Usage:
+使用方法：
     from run_agent import AIAgent
     
     agent = AIAgent(base_url="http://localhost:30000/v1", model="claude-opus-4-20250514")
@@ -45,8 +44,8 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
-# Load .env from ~/.hermes/.env first, then project root as dev fallback.
-# User-managed env files should override stale shell exports on restart.
+# 首先从 ~/.hermes/.env 加载 .env，然后从项目根目录作为开发后备。
+# 用户管理的环境文件应该在重启时覆盖过时的 shell 导出。
 from hermes_cli.env_loader import load_hermes_dotenv
 
 _hermes_home = get_hermes_home()
@@ -59,7 +58,7 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
-# Import our tool system
+# 导入我们的工具系统
 from model_tools import (
     get_tool_definitions,
     get_toolset_for_tool,
@@ -74,7 +73,7 @@ from tools.browser_tool import cleanup_browser
 
 from hermes_constants import OPENROUTER_BASE_URL
 
-# Agent internals extracted to agent/ package for modularity
+# 代理内部组件提取到 agent/ 包中以实现模块化
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -92,6 +91,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.skill_evolution import SkillEvolutionManager
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -211,11 +211,11 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
-# Tools that must never run concurrently (interactive / user-facing).
-# When any of these appear in a batch, we fall back to sequential execution.
+# 绝不能并发运行的工具（交互式/面向用户）。
+# 当这些工具中的任何一个出现在批次中时，我们会回退到顺序执行。
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
-# Read-only tools with no shared mutable session state.
+# 没有共享可变会话状态的只读工具。
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
     "ha_list_entities",
@@ -230,13 +230,13 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "web_search",
 })
 
-# File tools can run concurrently when they target independent paths.
+# 当文件工具针对独立路径时，可以并发运行。
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
-# Maximum number of concurrent worker threads for parallel tool execution.
+# 并行工具执行的最大并发工作线程数。
 _MAX_TOOL_WORKERS = 8
 
-# Patterns that indicate a terminal command may modify/delete files.
+# 表示终端命令可能修改/删除文件的模式。
 _DESTRUCTIVE_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
         rm\s|rmdir\s|
@@ -249,12 +249,12 @@ _DESTRUCTIVE_PATTERNS = re.compile(
     )""",
     re.VERBOSE,
 )
-# Output redirects that overwrite files (> but not >>)
+# 覆盖文件的输出重定向（> 但不是 >>）
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 
 def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
+    """启发式判断：这个终端命令看起来像是修改/删除文件吗？"""
     if not cmd:
         return False
     if _DESTRUCTIVE_PATTERNS.search(cmd):
@@ -265,7 +265,7 @@ def _is_destructive_command(cmd: str) -> bool:
 
 
 def _should_parallelize_tool_batch(tool_calls) -> bool:
-    """Return True when a tool-call batch is safe to run concurrently."""
+    """当工具调用批次可以安全并发运行时返回 True。"""
     if len(tool_calls) <= 1:
         return False
 
@@ -309,7 +309,7 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
 
 
 def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
-    """Return the normalized file target for path-scoped tools."""
+    """返回路径范围工具的标准化文件目标。"""
     if tool_name not in _PATH_SCOPED_TOOLS:
         return None
 
@@ -321,16 +321,16 @@ def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | 
     if expanded.is_absolute():
         return Path(os.path.abspath(str(expanded)))
 
-    # Avoid resolve(); the file may not exist yet.
+    # 避免使用 resolve()；文件可能还不存在。
     return Path(os.path.abspath(str(Path.cwd() / expanded)))
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
-    """Return True when two paths may refer to the same subtree."""
+    """当两个路径可能引用同一子树时返回 True。"""
     left_parts = left.parts
     right_parts = right.parts
     if not left_parts or not right_parts:
-        # Empty paths shouldn't reach here (guarded upstream), but be safe.
+        # 空路径不应该到达这里（上游已防护），但为了安全起见。
         return bool(left_parts) == bool(right_parts) and bool(left_parts)
     common_len = min(len(left_parts), len(right_parts))
     return left_parts[:common_len] == right_parts[:common_len]
@@ -343,10 +343,10 @@ _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
 
 def _sanitize_surrogates(text: str) -> str:
-    """Replace lone surrogate code points with U+FFFD (replacement character).
+    """用 U+FFFD（替换字符）替换单独的代理代码点。
 
-    Surrogates are invalid in UTF-8 and will crash ``json.dumps()`` inside the
-    OpenAI SDK.  This is a fast no-op when the text contains no surrogates.
+    代理在 UTF-8 中是无效的，会导致 OpenAI SDK 内部的 ``json.dumps()`` 崩溃。
+    当文本不包含代理时，这是一个快速的无操作。
     """
     if _SURROGATE_RE.search(text):
         return _SURROGATE_RE.sub('\ufffd', text)
@@ -354,12 +354,12 @@ def _sanitize_surrogates(text: str) -> str:
 
 
 def _sanitize_structure_surrogates(payload: Any) -> bool:
-    """Replace surrogate code points in nested dict/list payloads in-place.
+    """就地替换嵌套字典/列表负载中的代理代码点。
 
-    Mirror of ``_sanitize_structure_non_ascii`` but for surrogate recovery.
-    Used to scrub nested structured fields (e.g. ``reasoning_details`` — an
-    array of dicts with ``summary``/``text`` strings) that flat per-field
-    checks don't reach.  Returns True if any surrogates were replaced.
+    ``_sanitize_structure_non_ascii`` 的镜像，但用于代理恢复。
+    用于清理嵌套结构字段（例如 ``reasoning_details`` — 一个包含
+    ``summary``/``text`` 字符串的字典数组），这些字段是扁平化按字段检查
+    无法触及的。如果替换了任何代理，则返回 True。
     """
     found = False
 
@@ -387,16 +387,15 @@ def _sanitize_structure_surrogates(payload: Any) -> bool:
 
 
 def _sanitize_messages_surrogates(messages: list) -> bool:
-    """Sanitize surrogate characters from all string content in a messages list.
+    """清理消息列表中所有字符串内容的代理字符。
 
-    Walks message dicts in-place. Returns True if any surrogates were found
-    and replaced, False otherwise. Covers content/text, name, tool call
-    metadata/arguments, AND any additional string or nested structured fields
-    (``reasoning``, ``reasoning_content``, ``reasoning_details``, etc.) so
-    retries don't fail on a non-content field.  Byte-level reasoning models
-    (xiaomi/mimo, kimi, glm) can emit lone surrogates in reasoning output
-    that flow through to ``api_messages["reasoning_content"]`` on the next
-    turn and crash json.dumps inside the OpenAI SDK.
+    就地遍历消息字典。如果找到并替换了任何代理则返回 True，
+    否则返回 False。涵盖内容/文本、名称、工具调用元数据/参数，
+    以及任何额外的字符串或嵌套结构字段（``reasoning``、
+    ``reasoning_content``、``reasoning_details`` 等），这样重试
+    不会在非内容字段上失败。字节级推理模型（xiaomi/mimo、kimi、glm）
+    可以在推理输出中发出单独的代理，这些代理会在下一轮传递到
+    ``api_messages["reasoning_content"]`` 并导致 OpenAI SDK 内部的 json.dumps 崩溃。
     """
     found = False
     for msg in messages:
@@ -436,11 +435,11 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                     if isinstance(fn_args, str) and _SURROGATE_RE.search(fn_args):
                         fn["arguments"] = _SURROGATE_RE.sub('\ufffd', fn_args)
                         found = True
-        # Walk any additional string / nested fields (reasoning,
-        # reasoning_content, reasoning_details, etc.) — surrogates from
-        # byte-level reasoning models (xiaomi/mimo, kimi, glm) can lurk
-        # in these fields and aren't covered by the per-field checks above.
-        # Matches _sanitize_messages_non_ascii's coverage (PR #10537).
+        # 遍历任何额外的字符串/嵌套字段（reasoning、
+        # reasoning_content、reasoning_details 等）——来自字节级推理模型
+        # （xiaomi/mimo、kimi、glm）的代理可能潜伏在这些字段中，
+        # 并且未被上面的按字段检查覆盖。
+        # 匹配 _sanitize_messages_non_ascii 的覆盖范围（PR #10537）。
         for key, value in msg.items():
             if key in {"content", "name", "tool_calls", "role"}:
                 continue
@@ -455,26 +454,25 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
 
 
 def _strip_non_ascii(text: str) -> str:
-    """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
+    """删除非 ASCII 字符，替换为最接近的 ASCII 等价物或直接删除。
 
-    Used as a last resort when the system encoding is ASCII and can't handle
-    any non-ASCII characters (e.g. LANG=C on Chromebooks).
+    当系统编码为 ASCII 且无法处理任何非 ASCII 字符时
+    用作最后的手段（例如 Chromebooks 上的 LANG=C）。
     """
     return text.encode('ascii', errors='ignore').decode('ascii')
 
 
 def _sanitize_messages_non_ascii(messages: list) -> bool:
-    """Strip non-ASCII characters from all string content in a messages list.
+    """清理消息列表中所有字符串内容的非 ASCII 字符。
 
-    This is a last-resort recovery for systems with ASCII-only encoding
-    (LANG=C, Chromebooks, minimal containers).  Returns True if any
-    non-ASCII content was found and sanitized.
+    这是仅 ASCII 编码系统（LANG=C、Chromebooks、最小容器）的
+    最后恢复手段。如果找到并清理了任何非 ASCII 内容，则返回 True。
     """
     found = False
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        # Sanitize content (string)
+        # 清理内容（字符串）
         content = msg.get("content")
         if isinstance(content, str):
             sanitized = _strip_non_ascii(content)
@@ -490,14 +488,14 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                         if sanitized != text:
                             part["text"] = sanitized
                             found = True
-        # Sanitize name field (can contain non-ASCII in tool results)
+        # 清理名称字段（在工具结果中可能包含非 ASCII）
         name = msg.get("name")
         if isinstance(name, str):
             sanitized = _strip_non_ascii(name)
             if sanitized != name:
                 msg["name"] = sanitized
                 found = True
-        # Sanitize tool_calls
+        # 清理 tool_calls
         tool_calls = msg.get("tool_calls")
         if isinstance(tool_calls, list):
             for tc in tool_calls:
@@ -510,7 +508,7 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
                             if sanitized != fn_args:
                                 fn["arguments"] = sanitized
                                 found = True
-        # Sanitize any additional top-level string fields (e.g. reasoning_content)
+        # 清理任何额外的顶级字符串字段（例如 reasoning_content）
         for key, value in msg.items():
             if key in {"content", "name", "tool_calls", "role"}:
                 continue
@@ -523,12 +521,12 @@ def _sanitize_messages_non_ascii(messages: list) -> bool:
 
 
 def _sanitize_tools_non_ascii(tools: list) -> bool:
-    """Strip non-ASCII characters from tool payloads in-place."""
+    """就地清理工具负载中的非 ASCII 字符。"""
     return _sanitize_structure_non_ascii(tools)
 
 
 def _sanitize_structure_non_ascii(payload: Any) -> bool:
-    """Strip non-ASCII characters from nested dict/list payloads in-place."""
+    """就地清理嵌套字典/列表负载中的非 ASCII 字符。"""
     found = False
 
     def _walk(node):
@@ -560,20 +558,19 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 
 # =========================================================================
-# Large tool result handler — save oversized output to temp file
+# 大型工具结果处理器 — 将超大输出保存到临时文件
 # =========================================================================
 
 
 # =========================================================================
-# Qwen Portal headers — mimics QwenCode CLI for portal.qwen.ai compatibility.
-# Extracted as a module-level helper so both __init__ and
-# _apply_client_headers_for_base_url can share it.
+# Qwen Portal 头部 — 模拟 QwenCode CLI 以兼容 portal.qwen.ai。
+# 提取为模块级辅助函数，以便 __init__ 和 _apply_client_headers_for_base_url 可以共享它。
 # =========================================================================
 _QWEN_CODE_VERSION = "0.14.1"
 
 
 def _qwen_portal_headers() -> dict:
-    """Return default HTTP headers required by Qwen Portal API."""
+    """返回 Qwen Portal API 所需的默认 HTTP 头部。"""
     import platform as _plat
 
     _ua = f"QwenCode/{_QWEN_CODE_VERSION} ({_plat.system().lower()}; {_plat.machine()})"
@@ -587,11 +584,41 @@ def _qwen_portal_headers() -> dict:
 
 class AIAgent:
     """
-    AI Agent with tool calling capabilities.
+    具有工具调用能力的 AI 代理。
 
-    This class manages the conversation flow, tool execution, and response handling
-    for AI models that support function calling.
+    此类管理支持函数调用的 AI 模型的对话流程、工具执行和响应处理。
     """
+
+    @property
+    def _iters_since_skill(self) -> int:
+        manager = getattr(self, "skill_evolution", None)
+        return manager.iters_since_skill if manager else 0
+
+    @_iters_since_skill.setter
+    def _iters_since_skill(self, value: int) -> None:
+        manager = getattr(self, "skill_evolution", None)
+        if manager is None:
+            self.skill_evolution = SkillEvolutionManager()
+            manager = self.skill_evolution
+        try:
+            manager.iters_since_skill = int(value)
+        except Exception:
+            manager.iters_since_skill = 0
+
+    @property
+    def _skill_nudge_interval(self) -> int:
+        manager = getattr(self, "skill_evolution", None)
+        if manager is None:
+            return SkillEvolutionManager.DEFAULT_CREATION_NUDGE_INTERVAL
+        return manager.creation_nudge_interval
+
+    @_skill_nudge_interval.setter
+    def _skill_nudge_interval(self, value: int) -> None:
+        manager = getattr(self, "skill_evolution", None)
+        if manager is None:
+            self.skill_evolution = SkillEvolutionManager(value)
+        else:
+            manager.creation_nudge_interval = SkillEvolutionManager._coerce_interval(value)
 
     @property
     def base_url(self) -> str:
@@ -613,7 +640,7 @@ class AIAgent:
         command: str = None,
         args: list[str] | None = None,
         model: str = "",
-        max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+        max_iterations: int = 90,  # 默认工具调用迭代次数（与子代理共享）
         tool_delay: float = 1.0,
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
@@ -662,75 +689,73 @@ class AIAgent:
         persist_session: bool = True,
     ):
         """
-        Initialize the AI Agent.
+        初始化 AI 代理。
 
-        Args:
-            base_url (str): Base URL for the model API (optional)
-            api_key (str): API key for authentication (optional, uses env var if not provided)
-            provider (str): Provider identifier (optional; used for telemetry/routing hints)
-            api_mode (str): API mode override: "chat_completions" or "codex_responses"
-            model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-            max_iterations (int): Maximum number of tool calling iterations (default: 90)
-            tool_delay (float): Delay between tool calls in seconds (default: 1.0)
-            enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
-            disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
-            save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
-            verbose_logging (bool): Enable verbose logging for debugging (default: False)
-            quiet_mode (bool): Suppress progress output for clean CLI experience (default: False)
-            ephemeral_system_prompt (str): System prompt used during agent execution but NOT saved to trajectories (optional)
-            log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses (default: 100)
-            log_prefix (str): Prefix to add to all log messages for identification in parallel processing (default: "")
-            providers_allowed (List[str]): OpenRouter providers to allow (optional)
-            providers_ignored (List[str]): OpenRouter providers to ignore (optional)
-            providers_order (List[str]): OpenRouter providers to try in order (optional)
-            provider_sort (str): Sort providers by price/throughput/latency (optional)
-            session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
-            tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
-            clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
-                Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
-            max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
-            reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
-                If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
-            prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
-                Useful for injecting a few-shot example or priming the model's response style.
-                Example: [{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
-                NOTE: Anthropic Sonnet 4.6+ and Opus 4.6+ reject a conversation that ends on an
-                assistant-role message (400 error).  For those models use structured outputs or
-                output_config.format instead of a trailing-assistant prefill.
-            platform (str): The interface platform the user is on (e.g. "cli", "telegram", "discord", "whatsapp").
-                Used to inject platform-specific formatting hints into the system prompt.
-            skip_context_files (bool): If True, skip auto-injection of SOUL.md, AGENTS.md, and .cursorrules
-                into the system prompt. Use this for batch processing and data generation to avoid
-                polluting trajectories with user-specific persona or project instructions.
+        参数：
+            base_url (str): 模型 API 的基础 URL（可选）
+            api_key (str): 身份验证的 API 密钥（可选，如果未提供则使用环境变量）
+            provider (str): 提供商标识符（可选；用于遥测/路由提示）
+            api_mode (str): API 模式覆盖："chat_completions" 或 "codex_responses"
+            model (str): 要使用的模型名称（默认："anthropic/claude-opus-4.6"）
+            max_iterations (int): 工具调用迭代的最大次数（默认：90）
+            tool_delay (float): 工具调用之间的延迟（秒）（默认：1.0）
+            enabled_toolsets (List[str]): 仅启用这些工具集中的工具（可选）
+            disabled_toolsets (List[str]): 禁用这些工具集中的工具（可选）
+            save_trajectories (bool): 是否将对话轨迹保存到 JSONL 文件（默认：False）
+            verbose_logging (bool): 启用详细日志记录用于调试（默认：False）
+            quiet_mode (bool): 抑制进度输出以获得干净的 CLI 体验（默认：False）
+            ephemeral_system_prompt (str): 代理执行期间使用的系统提示，但不保存到轨迹（可选）
+            log_prefix_chars (int): 在日志预览中显示的工具调用/响应字符数（默认：100）
+            log_prefix (str): 添加到所有日志消息的前缀，用于并行处理中的识别（默认：""）
+            providers_allowed (List[str]): 允许的 OpenRouter 提供商（可选）
+            providers_ignored (List[str]): 忽略的 OpenRouter 提供商（可选）
+            providers_order (List[str]): 按顺序尝试的 OpenRouter 提供商（可选）
+            provider_sort (str): 按价格/吞吐量/延迟对提供商排序（可选）
+            session_id (str): 用于日志记录的预生成会话 ID（可选，如果未提供则自动生成）
+            tool_progress_callback (callable): 进度通知的回调函数(tool_name, args_preview)
+            clarify_callback (callable): 交互式用户问题的回调函数(question, choices) -> str。
+                由平台层（CLI 或网关）提供。如果为 None，clarify 工具返回错误。
+            max_tokens (int): 模型响应的最大令牌数（可选，如果未设置则使用模型默认值）
+            reasoning_config (Dict): OpenRouter 推理配置覆盖（例如 {"effort": "none"} 以禁用思考）。
+                如果为 None，OpenRouter 默认为 {"enabled": True, "effort": "medium"}。设置以禁用/自定义推理。
+            prefill_messages (List[Dict]): 作为预填充上下文添加到对话历史的消息。
+                用于注入少样本示例或启动模型的响应风格。
+                示例：[{"role": "user", "content": "Hi!"}, {"role": "assistant", "content": "Hello!"}]
+                注意：Anthropic Sonnet 4.6+ 和 Opus 4.6+ 拒绝以助手角色消息结尾的对话
+                （400 错误）。对于这些模型，使用结构化输出或
+                output_config.format 而不是尾随助手预填充。
+            platform (str): 用户所在的接口平台（例如 "cli"、"telegram"、"discord"、"whatsapp"）。
+                用于向系统提示注入平台特定的格式提示。
+            skip_context_files (bool): 如果为 True，跳过自动注入 SOUL.md、AGENTS.md 和 .cursorrules
+                到系统提示中。用于批处理和数据生成，以避免用用户特定的角色或项目指令污染轨迹。
         """
         _install_safe_stdio()
 
         self.model = model
         self.max_iterations = max_iterations
-        # Shared iteration budget — parent creates, children inherit.
-        # Consumed by every LLM turn across parent + all subagents.
+        # 共享迭代预算 — 父代理创建，子代理继承。
+        # 由父代理 + 所有子代理的每个 LLM 回合消耗。
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
         self.quiet_mode = quiet_mode
         self.ephemeral_system_prompt = ephemeral_system_prompt
-        self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
-        self._user_id = user_id  # Platform user identifier (gateway sessions)
-        self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
-        # Pluggable print function — CLI replaces this with _cprint so that
-        # raw ANSI status lines are routed through prompt_toolkit's renderer
-        # instead of going directly to stdout where patch_stdout's StdoutProxy
-        # would mangle the escape sequences.  None = use builtins.print.
+        self.platform = platform  # "cli"、"telegram"、"discord"、"whatsapp" 等。
+        self._user_id = user_id  # 平台用户标识符（网关会话）
+        self._gateway_session_key = gateway_session_key  # 稳定的每聊天密钥（例如 agent:main:telegram:dm:123）
+        # 可插拔打印函数 — CLI 用 _cprint 替换它，以便原始 ANSI 状态行
+        # 通过 prompt_toolkit 的渲染器路由，而不是直接进入 stdout，
+        # 在那里 patch_stdout 的 StdoutProxy 会弄乱转义序列。None = 使用 builtins.print。
         self._print_fn = None
-        self.background_review_callback = None  # Optional sync callback for gateway delivery
+        self.background_review_callback = None  # 网关传递的可选同步回调
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
-        # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
+        # 存储有效的基础 URL 用于功能检测（提示缓存、推理等）
         self.base_url = base_url or ""
         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
         self.provider = provider_name or ""
@@ -752,12 +777,12 @@ class AIAgent:
             self.api_mode = "anthropic_messages"
             self.provider = "anthropic"
         elif self._base_url_lower.rstrip("/").endswith("/anthropic"):
-            # Third-party Anthropic-compatible endpoints (e.g. MiniMax, DashScope)
-            # use a URL convention ending in /anthropic. Auto-detect these so the
-            # Anthropic Messages API adapter is used instead of chat completions.
+            # 第三方 Anthropic 兼容端点（例如 MiniMax、DashScope）
+            # 使用以 /anthropic 结尾的 URL 约定。自动检测这些，
+            # 以便使用 Anthropic Messages API 适配器而不是聊天完成。
             self.api_mode = "anthropic_messages"
         elif self.provider == "bedrock" or "bedrock-runtime" in self._base_url_lower:
-            # AWS Bedrock — auto-detect from provider name or base URL.
+            # AWS Bedrock — 从提供商名称或基础 URL 自动检测。
             self.api_mode = "bedrock_converse"
         else:
             self.api_mode = "chat_completions"
@@ -773,15 +798,14 @@ class AIAgent:
         except Exception:
             pass
 
-        # GPT-5.x models usually require the Responses API path, but some
-        # providers have exceptions (for example Copilot's gpt-5-mini still
-        # uses chat completions). Also auto-upgrade for direct OpenAI URLs
-        # (api.openai.com) since all newer tool-calling models prefer
-        # Responses there. ACP runtimes are excluded: CopilotACPClient
-        # handles its own routing and does not implement the Responses API
-        # surface.
-        # When api_mode was explicitly provided, respect it — the user
-        # knows what their endpoint supports (#10473).
+        # GPT-5.x 模型通常需要 Responses API 路径，但一些
+        # 提供商有例外（例如 Copilot 的 gpt-5-mini 仍然
+        # 使用聊天完成）。对于直接 OpenAI URL（api.openai.com）也自动升级，
+        # 因为所有较新的工具调用模型更喜欢那里的 Responses。
+        # ACP 运行时被排除：CopilotACPClient 处理自己的路由，
+        # 并且不实现 Responses API 表面。
+        # 当明确提供 api_mode 时，尊重它 — 用户
+        # 知道他们的端点支持什么（#10473）。
         if (
             api_mode is None
             and self.api_mode == "chat_completions"
@@ -798,9 +822,9 @@ class AIAgent:
         ):
             self.api_mode = "codex_responses"
 
-        # Pre-warm OpenRouter model metadata cache in a background thread.
-        # fetch_model_metadata() is cached for 1 hour; this avoids a blocking
-        # HTTP request on the first API response when pricing is estimated.
+        # 在后台线程中预热 OpenRouter 模型元数据缓存。
+        # fetch_model_metadata() 缓存 1 小时；这避免了在估算定价时
+        # 第一次 API 响应上的阻塞 HTTP 请求。
         if self.provider == "openrouter" or self._is_openrouter_url():
             threading.Thread(
                 target=lambda: fetch_model_metadata(),
@@ -821,43 +845,43 @@ class AIAgent:
         self.tool_gen_callback = tool_gen_callback
 
         
-        # Tool execution state — allows _vprint during tool execution
-        # even when stream consumers are registered (no tokens streaming then)
+        # 工具执行状态 — 即使注册了流消费者，也允许在工具执行期间使用 _vprint
+        # （那时没有令牌流）
         self._executing_tools = False
 
-        # Interrupt mechanism for breaking out of tool loops
+        # 中断机制，用于跳出工具循环
         self._interrupt_requested = False
-        self._interrupt_message = None  # Optional message that triggered interrupt
-        self._execution_thread_id: int | None = None  # Set at run_conversation() start
+        self._interrupt_message = None  # 触发中断的可选消息
+        self._execution_thread_id: int | None = None  # 在 run_conversation() 开始时设置
         self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
 
-        # /steer mechanism — inject a user note into the next tool result
-        # without interrupting the agent. Unlike interrupt(), steer() does
-        # NOT set _interrupt_requested; it waits for the current tool batch
-        # to finish naturally, then the drain hook appends the text to the
-        # last tool result's content so the model sees it on its next
-        # iteration. Message-role alternation is preserved (we modify an
-        # existing tool message rather than inserting a new user turn).
+        # /steer 机制 — 将用户注释注入到下一个工具结果中
+        # 而不中断代理。与 interrupt() 不同，steer() 不会
+        # 设置 _interrupt_requested；它等待当前工具批次
+        # 自然完成，然后 drain 钩子将文本附加到
+        # 最后一个工具结果的内容中，以便模型在下次迭代中看到它。
+        # 消息角色交替得到保留（我们修改现有的工具消息，
+        # 而不是插入新的用户回合）。
         self._pending_steer: Optional[str] = None
         self._pending_steer_lock = threading.Lock()
 
-        # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
-        # runs each tool on its own ThreadPoolExecutor worker — those worker
-        # threads have tids distinct from `_execution_thread_id`, so
-        # `_set_interrupt(True, _execution_thread_id)` alone does NOT cause
-        # `is_interrupted()` inside the worker to return True.  Track the
-        # workers here so `interrupt()` / `clear_interrupt()` can fan out to
-        # their tids explicitly.
+        # 并发工具工作线程跟踪。`_execute_tool_calls_concurrent`
+        # 在自己的 ThreadPoolExecutor 工作器上运行每个工具 — 那些工作器
+        # 线程的 tid 与 `_execution_thread_id` 不同，因此
+        # `_set_interrupt(True, _execution_thread_id)` 本身不会导致
+        # 工作器内部的 `is_interrupted()` 返回 True。在这里跟踪
+        # 工作器，以便 `interrupt()` / `clear_interrupt()` 可以明确地
+        # 扩散到它们的 tid。
         self._tool_worker_threads: set[int] = set()
         self._tool_worker_threads_lock = threading.Lock()
         
-        # Subagent delegation state
-        self._delegate_depth = 0        # 0 = top-level agent, incremented for children
-        self._active_children = []      # Running child AIAgents (for interrupt propagation)
+        # 子代理委派状态
+        self._delegate_depth = 0        # 0 = 顶级代理，子代理递增
+        self._active_children = []      # 运行中的子 AIAgent（用于中断传播）
         self._active_children_lock = threading.Lock()
         
-        # Store OpenRouter provider preferences
+        # 存储 OpenRouter 提供商偏好
         self.providers_allowed = providers_allowed
         self.providers_ignored = providers_ignored
         self.providers_order = providers_order
@@ -865,52 +889,52 @@ class AIAgent:
         self.provider_require_parameters = provider_require_parameters
         self.provider_data_collection = provider_data_collection
 
-        # Store toolset filtering options
+        # 存储工具集过滤选项
         self.enabled_toolsets = enabled_toolsets
         self.disabled_toolsets = disabled_toolsets
         
-        # Model response configuration
-        self.max_tokens = max_tokens  # None = use model default
-        self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
+        # 模型响应配置
+        self.max_tokens = max_tokens  # None = 使用模型默认值
+        self.reasoning_config = reasoning_config  # None = 使用默认值（OpenRouter 为 medium）
         self.service_tier = service_tier
         self.request_overrides = dict(request_overrides or {})
-        self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
+        self.prefill_messages = prefill_messages or []  # 预填充的对话回合
         self._force_ascii_payload = False
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Anthropic 提示缓存：通过 OpenRouter 为 Claude 模型自动启用。
+        # 通过缓存对话前缀在多轮对话中减少约 75% 的输入成本。
+        # 使用 system_and_3 策略（4 个断点）。
         is_openrouter = self._is_openrouter_url()
         is_claude = "claude" in self.model.lower()
         is_native_anthropic = self.api_mode == "anthropic_messages" and self.provider == "anthropic"
         self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
-        self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
+        self._cache_ttl = "5m"  # 默认 5 分钟 TTL（1.25 倍写入成本）
         
-        # Iteration budget: the LLM is only notified when it actually exhausts
-        # the iteration budget (api_call_count >= max_iterations).  At that
-        # point we inject ONE message, allow one final API call, and if the
-        # model doesn't produce a text response, force a user-message asking
-        # it to summarise.  No intermediate pressure warnings — they caused
-        # models to "give up" prematurely on complex tasks (#7915).
+        # 迭代预算：仅当 LLM 实际耗尽迭代预算时
+        # （api_call_count >= max_iterations）才会通知 LLM。此时
+        # 我们注入一条消息，允许最后一次 API 调用，如果模型
+        # 没有产生文本响应，强制发送用户消息要求
+        # 它总结。没有中间压力警告 — 它们导致模型
+        # 在复杂任务上过早"放弃"（#7915）。
         self._budget_exhausted_injected = False
         self._budget_grace_call = False
 
-        # Activity tracking — updated on each API call, tool execution, and
-        # stream chunk.  Used by the gateway timeout handler to report what the
-        # agent was doing when it was killed, and by the "still working"
-        # notifications to show progress.
+        # 活动跟踪 — 在每次 API 调用、工具执行和
+        # 流块时更新。由网关超时处理器用于报告
+        # 代理被杀死时正在做什么，以及通过"仍在工作"
+        # 通知显示进度。
         self._last_activity_ts: float = time.time()
         self._last_activity_desc: str = "initializing"
         self._current_tool: str | None = None
         self._api_call_count: int = 0
 
-        # Rate limit tracking — updated from x-ratelimit-* response headers
-        # after each API call.  Accessed by /usage slash command.
+        # 速率限制跟踪 — 在每次 API 调用后从 x-ratelimit-* 响应头更新。
+        # 由 /usage 斜杠命令访问。
         self._rate_limit_state: Optional["RateLimitState"] = None
 
-        # Centralized logging — agent.log (INFO+) and errors.log (WARNING+)
-        # both live under ~/.hermes/logs/.  Idempotent, so gateway mode
-        # (which creates a new AIAgent per message) won't duplicate handlers.
+        # 集中式日志记录 — agent.log (INFO+) 和 errors.log (WARNING+)
+        # 都位于 ~/.hermes/logs/ 下。幂等，因此网关模式
+        # （每条消息创建一个新的 AIAgent）不会重复处理器。
         from hermes_logging import setup_logging, setup_verbose_logging
         setup_logging(hermes_home=_hermes_home)
 
@@ -919,10 +943,10 @@ class AIAgent:
             logger.info("Verbose logging enabled (third-party library logs suppressed)")
         else:
             if self.quiet_mode:
-                # In quiet mode (CLI default), suppress all tool/infra log
-                # noise on the *console*. The TUI has its own rich display
-                # for status; logger INFO/WARNING messages just clutter it.
-                # File handlers (agent.log, errors.log) still capture everything.
+                # 在安静模式（CLI 默认），抑制控制台上的所有工具/基础架构日志
+                # 噪音。TUI 有自己的丰富状态显示；
+                # logger INFO/WARNING 消息只会弄乱它。
+                # 文件处理器（agent.log、errors.log）仍然捕获所有内容。
                 for quiet_logger in [
                     'tools',               # all tools.* (terminal, browser, web, file, etc.)
                     'run_agent',            # agent runner internals
@@ -932,41 +956,38 @@ class AIAgent:
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
-        # Internal stream callback (set during streaming TTS).
-        # Initialized here so _vprint can reference it before run_conversation.
+        # 内部流回调（在流式 TTS 期间设置）。
+        # 在这里初始化，以便 _vprint 可以在 run_conversation 之前引用它。
         self._stream_callback = None
-        # Deferred paragraph break flag — set after tool iterations so a
-        # single "\n\n" is prepended to the next real text delta.
+        # 延迟段落中断标志 — 在工具迭代后设置，以便
+        # 单个 "\n\n" 被添加到下一个真实文本增量之前。
         self._stream_needs_break = False
-        # Visible assistant text already delivered through live token callbacks
-        # during the current model response. Used to avoid re-sending the same
-        # commentary when the provider later returns it as a completed interim
-        # assistant message.
+        # 在当前模型响应期间已经通过实时令牌回调传递的可见助手文本。
+        # 用于避免当提供者稍后将其作为完成的临时助手消息返回时重新发送相同的注释。
         self._current_streamed_assistant_text = ""
 
-        # Optional current-turn user-message override used when the API-facing
-        # user message intentionally differs from the persisted transcript
-        # (e.g. CLI voice mode adds a temporary prefix for the live call only).
+        # 可选的当前回合用户消息覆盖，当面向 API 的
+        # 用户消息故意与持久化的记录不同时使用
+        # （例如 CLI 语音模式仅为实时调用添加临时前缀）。
         self._persist_user_message_idx = None
         self._persist_user_message_override = None
 
-        # Cache anthropic image-to-text fallbacks per image payload/URL so a
-        # single tool loop does not repeatedly re-run auxiliary vision on the
-        # same image history.
+        # 缓存每个图像负载/URL 的 anthropic 图像到文本回退，以便
+        # 单个工具循环不会在同一图像历史记录上重复运行辅助视觉。
         self._anthropic_image_fallback_cache: Dict[str, str] = {}
 
-        # Initialize LLM client via centralized provider router.
-        # The router handles auth resolution, base URL, headers, and
-        # Codex/Anthropic wrapping for all known providers.
-        # raw_codex=True because the main agent needs direct responses.stream()
-        # access for Codex Responses API streaming.
+        # 通过集中式提供商路由器初始化 LLM 客户端。
+        # 路由器处理身份验证解析、基础 URL、头部，以及
+        # 所有已知提供商的 Codex/Anthropic 包装。
+        # raw_codex=True 因为主代理需要直接的 responses.stream()
+        # 访问以进行 Codex Responses API 流式传输。
         self._anthropic_client = None
         self._is_anthropic_oauth = False
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
-            # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
-            # (prompt caching, thinking budgets, adaptive thinking).
+            # Bedrock + Claude → 使用 AnthropicBedrock SDK 以获得完整的功能对等
+            # （提示缓存、思考预算、自适应思考）。
             _is_bedrock_anthropic = self.provider == "bedrock"
             if _is_bedrock_anthropic:
                 from agent.anthropic_adapter import build_anthropic_bedrock_client
@@ -984,9 +1005,9 @@ class AIAgent:
                 if not self.quiet_mode:
                     print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock + AnthropicBedrock SDK, {_br_region})")
             else:
-                # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-                # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
-                # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
+                # 仅当提供商实际上是 Anthropic 时才回退到 ANTHROPIC_TOKEN。
+                # 其他 anthropic_messages 提供商（MiniMax、Alibaba 等）必须使用自己的 API 密钥。
+                # 回退会将 Anthropic 凭据发送到第三方端点（修复 #1739、#minimax-401）。
                 _is_native_anthropic = self.provider == "anthropic"
                 effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
                 self.api_key = effective_key
@@ -1003,12 +1024,12 @@ class AIAgent:
                     if effective_key and len(effective_key) > 12:
                         print(f"🔑 Using token: {effective_key[:8]}...{effective_key[-4:]}")
         elif self.api_mode == "bedrock_converse":
-            # AWS Bedrock — uses boto3 directly, no OpenAI client needed.
-            # Region is extracted from the base_url or defaults to us-east-1.
+            # AWS Bedrock — 直接使用 boto3，不需要 OpenAI 客户端。
+            # 区域从 base_url 提取或默认为 us-east-1。
             import re as _re
             _region_match = _re.search(r"bedrock-runtime\.([a-z0-9-]+)\.", base_url or "")
             self._bedrock_region = _region_match.group(1) if _region_match else "us-east-1"
-            # Guardrail config — read from config.yaml at init time.
+            # 防护栏配置 — 在初始化时从 config.yaml 读取。
             self._bedrock_guardrail_config = None
             try:
                 from hermes_cli.config import load_config as _load_br_cfg
@@ -1031,8 +1052,8 @@ class AIAgent:
                 print(f"🤖 AI Agent initialized with model: {self.model} (AWS Bedrock, {self._bedrock_region}{_gr_label})")
         else:
             if api_key and base_url:
-                # Explicit credentials from CLI/gateway — construct directly.
-                # The runtime provider resolver already handled auth for us.
+                # 来自 CLI/网关的明确凭据 — 直接构造。
+                # 运行时提供商解析器已经为我们处理了身份验证。
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
                 if self.provider == "copilot-acp":
                     client_kwargs["command"] = self.acp_command
@@ -1055,7 +1076,7 @@ class AIAgent:
                 elif "portal.qwen.ai" in effective_base.lower():
                     client_kwargs["default_headers"] = _qwen_portal_headers()
             else:
-                # No explicit creds — use the centralized provider router
+                # 没有明确凭据 — 使用集中式提供商路由器
                 from agent.auxiliary_client import resolve_provider_client
                 _routed_client, _ = resolve_provider_client(
                     self.provider or "auto", model=self.model, raw_codex=True)
@@ -1068,14 +1089,14 @@ class AIAgent:
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
                 else:
-                    # When the user explicitly chose a non-OpenRouter provider
-                    # but no credentials were found, fail fast with a clear
-                    # message instead of silently routing through OpenRouter.
+                    # 当用户明确选择了非 OpenRouter 提供商
+                    # 但未找到凭据时，快速失败并显示清晰消息，
+                    # 而不是静默路由通过 OpenRouter。
                     _explicit = (self.provider or "").strip().lower()
                     if _explicit and _explicit not in ("auto", "openrouter", "custom"):
-                        # Look up the actual env var name from the provider
-                        # config — some providers use non-standard names
-                        # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
+                        # 从提供商配置中查找实际的环境变量名称
+                        # — 一些提供商使用非标准名称
+                        # （例如 alibaba → DASHSCOPE_API_KEY，而不是 ALIBABA_API_KEY）。
                         _env_hint = f"{_explicit.upper()}_API_KEY"
                         try:
                             from hermes_cli.auth import PROVIDER_REGISTRY
@@ -1089,7 +1110,7 @@ class AIAgent:
                             f"was found. Set the {_env_hint} environment "
                             f"variable, or switch to a different provider with `hermes model`."
                         )
-                    # No provider configured — reject with a clear message.
+                    # 没有配置提供商 — 用清晰消息拒绝。
                     raise RuntimeError(
                         "No LLM provider configured. Run `hermes model` to "
                         "select a provider, or run `hermes setup` for first-time "
@@ -1098,12 +1119,11 @@ class AIAgent:
             
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
-            # Enable fine-grained tool streaming for Claude on OpenRouter.
-            # Without this, Anthropic buffers the entire tool call and goes
-            # silent for minutes while thinking — OpenRouter's upstream proxy
-            # times out during the silence.  The beta header makes Anthropic
-            # stream tool call arguments token-by-token, keeping the
-            # connection alive.
+            # 为 OpenRouter 上的 Claude 启用细粒度工具流式传输。
+            # 没有这个，Anthropic 会缓冲整个工具调用并在思考时
+            # 沉默数分钟 — OpenRouter 的上游代理
+            # 在沉默期间超时。beta 头部使 Anthropic
+            # 逐令牌流式传输工具调用参数，保持连接活跃。
             _effective_base = str(client_kwargs.get("base_url", "")).lower()
             if "openrouter" in _effective_base and "claude" in (self.model or "").lower():
                 headers = client_kwargs.get("default_headers") or {}
@@ -1133,10 +1153,10 @@ class AIAgent:
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
         
-        # Provider fallback chain — ordered list of backup providers tried
-        # when the primary is exhausted (rate-limit, overload, connection
-        # failure).  Supports both legacy single-dict ``fallback_model`` and
-        # new list ``fallback_providers`` format.
+        # 提供商回退链 — 当主提供商耗尽（速率限制、过载、连接
+        # 失败）时尝试的备份提供商的有序列表。
+        # 支持传统的单一字典 ``fallback_model`` 和
+        # 新的列表 ``fallback_providers`` 格式。
         if isinstance(fallback_model, list):
             self._fallback_chain = [
                 f for f in fallback_model
@@ -1148,7 +1168,7 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = False
-        # Legacy attribute kept for backward compat (tests, external callers)
+        # 为向后兼容保留的传统属性（测试、外部调用者）
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
             if len(self._fallback_chain) == 1:
@@ -1158,14 +1178,14 @@ class AIAgent:
                 print(f"🔄 Fallback chain ({len(self._fallback_chain)} providers): " +
                       " → ".join(f"{f['model']} ({f['provider']})" for f in self._fallback_chain))
 
-        # Get available tools with filtering
+        # 获取可用工具并进行过滤
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
         
-        # Show tool configuration and store valid tool names for validation
+        # 显示工具配置并存储有效工具名称以进行验证
         self.valid_tool_names = set()
         if self.tools:
             self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
@@ -1173,7 +1193,7 @@ class AIAgent:
             if not self.quiet_mode:
                 print(f"🛠️  Loaded {len(self.tools)} tools: {', '.join(tool_names)}")
                 
-                # Show filtering info if applied
+                # 如果应用了过滤，显示过滤信息
                 if enabled_toolsets:
                     print(f"   ✅ Enabled toolsets: {', '.join(enabled_toolsets)}")
                 if disabled_toolsets:
@@ -1181,61 +1201,61 @@ class AIAgent:
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
         
-        # Check tool requirements
+        # 检查工具要求
         if self.tools and not self.quiet_mode:
             requirements = check_toolset_requirements()
             missing_reqs = [name for name, available in requirements.items() if not available]
             if missing_reqs:
                 print(f"⚠️  Some tools may not work due to missing requirements: {missing_reqs}")
         
-        # Show trajectory saving status
+        # 显示轨迹保存状态
         if self.save_trajectories and not self.quiet_mode:
             print("📝 Trajectory saving enabled")
         
-        # Show ephemeral system prompt status
+        # 显示临时系统提示状态
         if self.ephemeral_system_prompt and not self.quiet_mode:
             prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
             print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
         
-        # Show prompt caching status
+        # 显示提示缓存状态
         if self._use_prompt_caching and not self.quiet_mode:
             source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
             print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
-        # Session logging setup - auto-save conversation trajectories for debugging
+        # 会话日志设置 - 自动保存对话轨迹以进行调试
         self.session_start = datetime.now()
         if session_id:
-            # Use provided session ID (e.g., from CLI)
+            # 使用提供的会话 ID（例如，来自 CLI）
             self.session_id = session_id
         else:
-            # Generate a new session ID
+            # 生成新的会话 ID
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
         
-        # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
+        # 会话日志与网关会话一起进入 ~/.hermes/sessions/
         hermes_home = get_hermes_home()
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
         
-        # Track conversation messages for session logging
+        # 跟踪会话日志记录的对话消息
         self._session_messages: List[Dict[str, Any]] = []
         
-        # Cached system prompt -- built once per session, only rebuilt on compression
+        # 缓存的系统提示 -- 每个会话构建一次，仅在压缩时重建
         self._cached_system_prompt: Optional[str] = None
         
-        # Filesystem checkpoint manager (transparent — not a tool)
+        # 文件系统检查点管理器（透明 — 不是工具）
         from tools.checkpoint_manager import CheckpointManager
         self._checkpoint_mgr = CheckpointManager(
             enabled=checkpoints_enabled,
             max_snapshots=checkpoint_max_snapshots,
         )
         
-        # SQLite session store (optional -- provided by CLI or gateway)
+        # SQLite 会话存储（可选 -- 由 CLI 或网关提供）
         self._session_db = session_db
         self._parent_session_id = parent_session_id
-        self._last_flushed_db_idx = 0  # tracks DB-write cursor to prevent duplicate writes
+        self._last_flushed_db_idx = 0  # 跟踪 DB 写入游标以防止重复写入
         if self._session_db:
             try:
                 self._session_db.create_session(
@@ -1251,35 +1271,34 @@ class AIAgent:
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
-                # Transient SQLite lock contention (e.g. CLI and gateway writing
-                # concurrently) must NOT permanently disable session_search for
-                # this agent.  Keep _session_db alive — subsequent message
-                # flushes and session_search calls will still work once the
-                # lock clears.  The session row may be missing from the index
-                # for this run, but that is recoverable (flushes upsert rows).
+                # 瞬时 SQLite 锁争用（例如 CLI 和网关并发写入）
+                # 绝不能永久禁用此代理的 session_search。
+                # 保持 _session_db 活跃 — 后续消息刷新和
+                # session_search 调用在锁清除后仍将工作。
+                # 会话行可能在此运行的索引中丢失，但这是可恢复的（刷新 upsert 行）。
                 logger.warning(
                     "Session DB create_session failed (session_search still available): %s", e
                 )
         
-        # In-memory todo list for task planning (one per agent/session)
+        # 用于任务规划的内存待办事项列表（每个代理/会话一个）
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
         
-        # Load config once for memory, skills, and compression sections
+        # 为内存、技能和压缩部分加载一次配置
         try:
             from hermes_cli.config import load_config as _load_agent_config
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
 
-        # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
+        # 持久内存（MEMORY.md + USER.md）-- 从磁盘加载
         self._memory_store = None
         self._memory_enabled = False
         self._user_profile_enabled = False
         self._memory_nudge_interval = 10
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
-        self._iters_since_skill = 0
+        self.skill_evolution = SkillEvolutionManager.from_config(_agent_cfg)
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
@@ -1299,8 +1318,8 @@ class AIAgent:
         
 
 
-        # Memory provider plugin (external — one at a time, alongside built-in)
-        # Reads memory.provider from config to select which plugin to activate.
+        # 内存提供商插件（外部 -- 一次一个，与内置一起）
+        # 从配置读取 memory.provider 以选择要激活的插件。
         self._memory_manager = None
         if not skip_memory:
             try:
@@ -1321,8 +1340,8 @@ class AIAgent:
                             "hermes_home": str(_ghh()),
                             "agent_context": "primary",
                         }
-                        # Thread session title for memory provider scoping
-                        # (e.g. honcho uses this to derive chat-scoped session keys)
+                        # 内存提供商作用域的线程会话标题
+                        # （例如 honcho 使用它来推导聊天范围的会话密钥）
                         if self._session_db:
                             try:
                                 _st = self._session_db.get_session_title(self.session_id)
@@ -1330,13 +1349,13 @@ class AIAgent:
                                     _init_kwargs["session_title"] = _st
                             except Exception:
                                 pass
-                        # Thread gateway user identity for per-user memory scoping
+                        # 每用户内存作用域的线程网关用户身份
                         if self._user_id:
                             _init_kwargs["user_id"] = self._user_id
-                        # Thread gateway session key for stable per-chat Honcho session isolation
+                        # 稳定每聊天 Honcho 会话隔离的线程网关会话密钥
                         if self._gateway_session_key:
                             _init_kwargs["gateway_session_key"] = self._gateway_session_key
-                        # Profile identity for per-profile provider scoping
+                        # 每配置文件提供商作用域的配置文件身份
                         try:
                             from hermes_cli.profiles import get_active_profile_name
                             _profile = get_active_profile_name()
@@ -1353,12 +1372,11 @@ class AIAgent:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)
                 self._memory_manager = None
 
-        # Inject memory provider tool schemas into the tool surface.
-        # Skip tools whose names already exist (plugins may register the
-        # same tools via ctx.register_tool(), which lands in self.tools
-        # through get_tool_definitions()).  Duplicate function names cause
-        # 400 errors on providers that enforce unique names (e.g. Xiaomi
-        # MiMo via Nous Portal).
+        # 将内存提供商工具模式注入到工具表面。
+        # 跳过名称已存在的工具（插件可能通过 ctx.register_tool()
+        # 注册相同的工具，这些工具通过 get_tool_definitions() 进入 self.tools）。
+        # 重复的函数名在强制执行唯一名称的提供商上导致 400 错误
+        # （例如通过 Nous Portal 的 Xiaomi MiMo）。
         if self._memory_manager and self.tools is not None:
             _existing_tool_names = {
                 t.get("function", {}).get("name")
@@ -1375,24 +1393,17 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     _existing_tool_names.add(_tname)
 
-        # Skills config: nudge interval for skill creation reminders
-        self._skill_nudge_interval = 10
-        try:
-            skills_config = _agent_cfg.get("skills", {})
-            self._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
-        except Exception:
-            pass
-
-        # Tool-use enforcement config: "auto" (default — matches hardcoded
-        # model list), true (always), false (never), or list of substrings.
+        # 技能配置：技能创建提醒的推动间隔
+        # 工具使用强制配置："auto"（默认 -- 匹配硬编码模型列表）、
+        # true（总是）、false（从不）或子字符串列表。
         _agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_agent_section, dict):
             _agent_section = {}
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
-        # Initialize context compressor for automatic context management
-        # Compresses conversation when approaching model's context limit
-        # Configuration via config.yaml (compression section)
+        # 初始化上下文压缩器以进行自动上下文管理
+        # 在接近模型的上下文限制时压缩对话
+        # 通过 config.yaml 配置（压缩部分）
         _compression_cfg = _agent_cfg.get("compression", {})
         if not isinstance(_compression_cfg, dict):
             _compression_cfg = {}
@@ -1401,7 +1412,7 @@ class AIAgent:
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
 
-        # Read explicit context_length override from model config
+        # 从模型配置读取显式的 context_length 覆盖
         _model_cfg = _agent_cfg.get("model", {})
         if isinstance(_model_cfg, dict):
             _config_context_length = _model_cfg.get("context_length")
@@ -1426,10 +1437,10 @@ class AIAgent:
                 )
                 _config_context_length = None
 
-        # Store for reuse in switch_model (so config override persists across model switches)
+        # 存储以在 switch_model 中重用（因此配置覆盖在模型切换间保持）
         self._config_context_length = _config_context_length
 
-        # Check custom_providers per-model context_length
+        # 检查 custom_providers 的每个模型的 context_length
         if _config_context_length is None:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -1468,11 +1479,11 @@ class AIAgent:
                                     )
                     break
         
-        # Select context engine: config-driven (like memory providers).
-        # 1. Check config.yaml context.engine setting
-        # 2. Check plugins/context_engine/<name>/ directory (repo-shipped)
-        # 3. Check general plugin system (user-installed plugins)
-        # 4. Fall back to built-in ContextCompressor
+        # 选择上下文引擎：配置驱动（如内存提供商）。
+        # 1. 检查 config.yaml context.engine 设置
+        # 2. 检查 plugins/context_engine/<name>/ 目录（仓库附带）
+        # 3. 检查通用插件系统（用户安装的插件）
+        # 4. 回退到内置 ContextCompressor
         _selected_engine = None
         _engine_name = "compressor"  # default
         try:
@@ -1482,14 +1493,14 @@ class AIAgent:
             pass
 
         if _engine_name != "compressor":
-            # Try loading from plugins/context_engine/<name>/
+            # 尝试从 plugins/context_engine/<name>/ 加载
             try:
                 from plugins.context_engine import load_context_engine
                 _selected_engine = load_context_engine(_engine_name)
             except Exception as _ce_load_err:
                 logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
 
-            # Try general plugin system as fallback
+            # 尝试通用插件系统作为回退
             if _selected_engine is None:
                 try:
                     from hermes_cli.plugins import get_plugin_context_engine
@@ -1504,11 +1515,11 @@ class AIAgent:
                     "Context engine '%s' not found — falling back to built-in compressor",
                     _engine_name,
                 )
-        # else: config says "compressor" — use built-in, don't auto-activate plugins
+        # 否则：配置说 "compressor" — 使用内置，不要自动激活插件
 
         if _selected_engine is not None:
             self.context_compressor = _selected_engine
-            # Resolve context_length for plugin engines — mirrors switch_model() path
+            # 解析插件引擎的 context_length — 镜像 switch_model() 路径
             from agent.model_metadata import get_model_context_length
             _plugin_ctx_len = get_model_context_length(
                 self.model,
@@ -1543,8 +1554,8 @@ class AIAgent:
             )
         self.compression_enabled = compression_enabled
 
-        # Reject models whose context window is below the minimum required
-        # for reliable tool-calling workflows (64K tokens).
+        # 拒绝上下文窗口低于可靠工具调用工作流
+        # 所需最小值的模型（64K 令牌）。
         from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
         _ctx = getattr(self.context_compressor, "context_length", 0)
         if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH:
@@ -1556,7 +1567,7 @@ class AIAgent:
                 f"model.context_length in config.yaml to override."
             )
 
-        # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
+        # 注入上下文引擎工具模式（例如 lcm_grep、lcm_describe、lcm_expand）
         self._context_engine_tool_names: set = set()
         if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
             for _schema in self.context_compressor.get_tool_schemas():
@@ -1567,7 +1578,7 @@ class AIAgent:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
 
-        # Notify context engine of session start
+        # 通知上下文引擎会话开始
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_start(
@@ -1585,7 +1596,7 @@ class AIAgent:
         )
         self._user_turn_count = 0
 
-        # Cumulative token usage for the session
+        # 会话的累积令牌使用量
         self.session_prompt_tokens = 0
         self.session_completion_tokens = 0
         self.session_total_tokens = 0
@@ -1599,11 +1610,11 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
-        # ── Ollama num_ctx injection ──
-        # Ollama defaults to 2048 context regardless of the model's capabilities.
-        # When running against an Ollama server, detect the model's max context
-        # and pass num_ctx on every chat request so the full window is used.
-        # User override: set model.ollama_num_ctx in config.yaml to cap VRAM use.
+        # ── Ollama num_ctx 注入 ──
+        # Ollama 默认为 2048 上下文，无论模型的能力如何。
+        # 当针对 Ollama 服务器运行时，检测模型的最大上下文
+        # 并在每个聊天请求上传递 num_ctx，以便使用完整的窗口。
+        # 用户覆盖：在 config.yaml 中设置 model.ollama_num_ctx 以限制 VRAM 使用。
         self._ollama_num_ctx: int | None = None
         _ollama_num_ctx_override = None
         if isinstance(_model_cfg, dict):
@@ -1632,16 +1643,16 @@ class AIAgent:
             else:
                 print(f"📊 Context limit: {self.context_compressor.context_length:,} tokens (auto-compression disabled)")
 
-        # Check immediately so CLI users see the warning at startup.
-        # Gateway status_callback is not yet wired, so any warning is stored
-        # in _compression_warning and replayed in the first run_conversation().
+        # 立即检查，以便 CLI 用户在启动时看到警告。
+        # 网关 status_callback 尚未连接，因此任何警告都存储在
+        # _compression_warning 中并在第一次 run_conversation() 中重播。
         self._compression_warning = None
         self._check_compression_model_feasibility()
 
-        # Snapshot primary runtime for per-turn restoration.  When fallback
-        # activates during a turn, the next turn restores these values so the
-        # preferred model gets a fresh attempt each time.  Uses a single dict
-        # so new state fields are easy to add without N individual attributes.
+        # 为每回合恢复快照主要运行时。当回退
+        # 在一个回合中激活时，下一回合恢复这些值，
+        # 以便首选模型每次都有新的尝试。
+        # 使用单个字典，因此新状态字段易于添加，而无需 N 个单独属性。
         _cc = self.context_compressor
         self._primary_runtime = {
             "model": self.model,
@@ -1651,9 +1662,9 @@ class AIAgent:
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
-            # Context engine state that _try_activate_fallback() overwrites.
-            # Use getattr for model/base_url/api_key/provider since plugin
-            # engines may not have these (they're ContextCompressor-specific).
+            # _try_activate_fallback() 覆盖的上下文引擎状态。
+            # 对 model/base_url/api_key/provider 使用 getattr，因为插件
+            # 引擎可能没有这些（它们是 ContextCompressor 特定的）。
             "compressor_model": getattr(_cc, "model", self.model),
             "compressor_base_url": getattr(_cc, "base_url", self.base_url),
             "compressor_api_key": getattr(_cc, "api_key", ""),
@@ -1669,24 +1680,24 @@ class AIAgent:
             })
 
     def reset_session_state(self):
-        """Reset all session-scoped token counters to 0 for a fresh session.
+        """将所有会话范围的令牌计数器重置为 0 以开始新会话。
         
-        This method encapsulates the reset logic for all session-level metrics
-        including:
-        - Token usage counters (input, output, total, prompt, completion)
-        - Cache read/write tokens
-        - API call count
-        - Reasoning tokens
-        - Estimated cost tracking
-        - Context compressor internal counters
+        此方法封装了所有会话级别指标的重置逻辑，
+        包括：
+        - 令牌使用计数器（输入、输出、总计、提示、完成）
+        - 缓存读/写令牌
+        - API 调用次数
+        - 推理令牌
+        - 估算成本跟踪
+        - 上下文压缩器内部计数器
         
-        The method safely handles optional attributes (e.g., context compressor)
-        using ``hasattr`` checks.
+        该方法使用 ``hasattr`` 检查安全地处理可选属性
+        （例如上下文压缩器）。
         
-        This keeps the counter reset logic DRY and maintainable in one place
-        rather than scattering it across multiple methods.
+        这将计数器重置逻辑保持在一个地方的 DRY 和可维护性，
+        而不是分散在多个方法中。
         """
-        # Token usage counters
+        # 令牌使用计数器
         self.session_total_tokens = 0
         self.session_input_tokens = 0
         self.session_output_tokens = 0
@@ -1700,40 +1711,38 @@ class AIAgent:
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
         
-        # Turn counter (added after reset_session_state was first written — #2635)
+        # 回合计数器（在 reset_session_state 首次编写后添加 — #2635）
         self._user_turn_count = 0
 
-        # Context engine reset (works for both built-in compressor and plugins)
+        # 上下文引擎重置（适用于内置压缩器和插件）
         if hasattr(self, "context_compressor") and self.context_compressor:
             self.context_compressor.on_session_reset()
     
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
-        """Switch the model/provider in-place for a live agent.
+        """就地切换实时代理的模型/提供商。
 
-        Called by the /model command handlers (CLI and gateway) after
-        ``model_switch.switch_model()`` has resolved credentials and
-        validated the model.  This method performs the actual runtime
-        swap: rebuilding clients, updating caching flags, and refreshing
-        the context compressor.
+        在 ``model_switch.switch_model()`` 解析凭据并
+        验证模型后，由 /model 命令处理器（CLI 和网关）调用。
+        此方法执行实际的运行时交换：重建客户端、
+        更新缓存标志和刷新上下文压缩器。
 
-        The implementation mirrors ``_try_activate_fallback()`` for the
-        client-swap logic but also updates ``_primary_runtime`` so the
-        change persists across turns (unlike fallback which is
-        turn-scoped).
+        该实现镜像了 ``_try_activate_fallback()`` 的
+        客户端交换逻辑，但也更新 ``_primary_runtime``，
+        以便更改在回合间持续存在（不同于回合范围的回退）。
         """
         import logging
         import re as _re
         from hermes_cli.providers import determine_api_mode
 
-        # ── Determine api_mode if not provided ──
+        # ── 如果未提供，确定 api_mode ──
         if not api_mode:
             api_mode = determine_api_mode(new_provider, base_url)
 
-        # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
-        # /v1 into the anthropic_messages client, which would cause the SDK to
-        # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
-        # this, but we guard here so any direct callers (future code paths,
-        # tests) can't reintroduce the double-/v1 404 bug.
+        # 深度防御：确保 OpenCode base_url 不会将尾随的
+        # /v1 带入 anthropic_messages 客户端，这将导致 SDK
+        # 命中 /v1/v1/messages。`model_switch.switch_model()` 已经剥离了
+        # 这个，但我们在这里防护，以便任何直接调用者（未来的代码路径、
+        # 测试）不能重新引入双 /v1 404 错误。
         if (
             api_mode == "anthropic_messages"
             and new_provider in ("opencode-zen", "opencode-go")
@@ -1745,7 +1754,7 @@ class AIAgent:
         old_model = self.model
         old_provider = self.provider
 
-        # ── Swap core runtime fields ──
+        # ── 交换核心运行时字段 ──
         self.model = new_model
         self.provider = new_provider
         self.base_url = base_url or self.base_url
@@ -1753,16 +1762,16 @@ class AIAgent:
         if api_key:
             self.api_key = api_key
 
-        # ── Build new client ──
+        # ── 构建新客户端 ──
         if api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
                 build_anthropic_client,
                 resolve_anthropic_token,
                 _is_oauth_token,
             )
-            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
-            # API key — falling back would send Anthropic credentials to third-party endpoints.
+            # 仅当提供商实际上是 Anthropic 时才回退到 ANTHROPIC_TOKEN。
+            # 其他 anthropic_messages 提供商（MiniMax、Alibaba 等）必须使用自己的
+            # API 密钥 — 回退会将 Anthropic 凭据发送到第三方端点。
             _is_native_anthropic = new_provider == "anthropic"
             effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
             self.api_key = effective_key
@@ -1787,14 +1796,14 @@ class AIAgent:
                 shared=True,
             )
 
-        # ── Re-evaluate prompt caching ──
+        # ── 重新评估提示缓存 ──
         is_native_anthropic = api_mode == "anthropic_messages" and new_provider == "anthropic"
         self._use_prompt_caching = (
             ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
             or is_native_anthropic
         )
 
-        # ── Update context compressor ──
+        # ── 更新上下文压缩器 ──
         if hasattr(self, "context_compressor") and self.context_compressor:
             from agent.model_metadata import get_model_context_length
             new_context_length = get_model_context_length(
@@ -1813,10 +1822,10 @@ class AIAgent:
                 api_mode=self.api_mode,
             )
 
-        # ── Invalidate cached system prompt so it rebuilds next turn ──
+        # ── 使缓存的系统提示失效，以便下一回合重建 ──
         self._cached_system_prompt = None
 
-        # ── Update _primary_runtime so the change persists across turns ──
+        # ── 更新 _primary_runtime 以便更改在回合间持续存在 ──
         _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
         self._primary_runtime = {
             "model": self.model,
@@ -1840,7 +1849,7 @@ class AIAgent:
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
 
-        # ── Reset fallback state ──
+        # ── 重置回退状态 ──
         self._fallback_activated = False
         self._fallback_index = 0
 
@@ -1850,16 +1859,16 @@ class AIAgent:
         )
 
     def _safe_print(self, *args, **kwargs):
-        """Print that silently handles broken pipes / closed stdout.
+        """静默处理断管/关闭 stdout 的打印。
 
-        In headless environments (systemd, Docker, nohup) stdout may become
-        unavailable mid-session.  A raw ``print()`` raises ``OSError`` which
-        can crash cron jobs and lose completed work.
+        在无头环境（systemd、Docker、nohup）中，stdout 可能在
+        会话中途变得不可用。原始的 ``print()`` 会引发 ``OSError``，
+        这可能导致 cron 作业崩溃并丢失已完成的工作。
 
-        Internally routes through ``self._print_fn`` (default: builtin
-        ``print``) so callers such as the CLI can inject a renderer that
-        handles ANSI escape sequences properly (e.g. prompt_toolkit's
-        ``print_formatted_text(ANSI(...))``) without touching this method.
+        内部通过 ``self._print_fn``（默认：内置 ``print``）路由，
+        以便调用者（如 CLI）可以注入正确处理 ANSI 转义序列的
+        渲染器（例如 prompt_toolkit 的 ``print_formatted_text(ANSI(...))``），
+        而无需触及此方法。
         """
         try:
             fn = self._print_fn or print
@@ -1868,23 +1877,22 @@ class AIAgent:
             pass
 
     def _vprint(self, *args, force: bool = False, **kwargs):
-        """Verbose print — suppressed when actively streaming tokens.
+        """详细打印 — 在主动流式传输令牌时被抑制。
 
-        Pass ``force=True`` for error/warning messages that should always be
-        shown even during streaming playback (TTS or display).
+        对于应该始终显示的错误/警告消息，即使
+        在流式播放（TTS 或显示）期间，也传递 ``force=True``。
 
-        During tool execution (``_executing_tools`` is True), printing is
-        allowed even with stream consumers registered because no tokens
-        are being streamed at that point.
+        在工具执行期间（``_executing_tools`` 为 True），即使注册了
+        流消费者，也允许打印，因为此时没有
+        令牌正在流式传输。
 
-        After the main response has been delivered and the remaining tool
-        calls are post-response housekeeping (``_mute_post_response``),
-        all non-forced output is suppressed.
+        在主响应已交付且剩余工具调用是响应后清理
+        （``_mute_post_response``）时，所有非强制输出都被抑制。
 
-        ``suppress_status_output`` is a stricter CLI automation mode used by
-        parseable single-query flows such as ``hermes chat -q``. In that mode,
-        all status/diagnostic prints routed through ``_vprint`` are suppressed
-        so stdout stays machine-readable.
+        ``suppress_status_output`` 是更严格的 CLI 自动化模式，
+        用于可解析的单查询流程，如 ``hermes chat -q``。
+        在该模式下，所有通过 ``_vprint`` 路由的状态/诊断打印
+        都被抑制，以保持 stdout 的机器可读性。
         """
         if getattr(self, "suppress_status_output", False):
             return
@@ -1895,13 +1903,13 @@ class AIAgent:
         self._safe_print(*args, **kwargs)
 
     def _should_start_quiet_spinner(self) -> bool:
-        """Return True when quiet-mode spinner output has a safe sink.
+        """当安静模式旋转器输出有安全接收器时返回 True。
 
-        In headless/stdio-protocol environments, a raw spinner with no custom
-        ``_print_fn`` falls back to ``sys.stdout`` and can corrupt protocol
-        streams such as ACP JSON-RPC. Allow quiet spinners only when either:
-        - output is explicitly rerouted via ``_print_fn``; or
-        - stdout is a real TTY.
+        在无头/stdio 协议环境中，没有自定义 ``_print_fn`` 的
+        原始旋转器会回退到 ``sys.stdout`` 并可能损坏协议
+        流，如 ACP JSON-RPC。仅当以下情况之一时才允许安静旋转器：
+        - 输出通过 ``_print_fn`` 明确重新路由；或
+        - stdout 是真实的 TTY。
         """
         if self._print_fn is not None:
             return True
@@ -1914,12 +1922,11 @@ class AIAgent:
             return False
 
     def _should_emit_quiet_tool_messages(self) -> bool:
-        """Return True when quiet-mode tool summaries should print directly.
+        """当安静模式工具摘要应直接打印时返回 True。
 
-        Quiet mode is used by both the interactive CLI and embedded/library
-        callers. The CLI may still want compact progress hints when no callback
-        owns rendering. Embedded/library callers, on the other hand, expect
-        quiet mode to be truly silent.
+        安静模式由交互式 CLI 和嵌入式/库调用者使用。
+        当没有回调拥有渲染时，CLI 可能仍希望有紧凑的进度提示。
+        另一方面，嵌入式/库调用者期望安静模式真正静默。
         """
         return (
             self.quiet_mode
@@ -1928,14 +1935,14 @@ class AIAgent:
         )
 
     def _emit_status(self, message: str) -> None:
-        """Emit a lifecycle status message to both CLI and gateway channels.
+        """向 CLI 和网关通道发出生命周期状态消息。
 
-        CLI users see the message via ``_vprint(force=True)`` so it is always
-        visible regardless of verbose/quiet mode.  Gateway consumers receive
-        it through ``status_callback("lifecycle", ...)``.
+        CLI 用户通过 ``_vprint(force=True)`` 看到消息，因此无论
+        详细/安静模式如何，它始终可见。网关消费者
+        通过 ``status_callback("lifecycle", ...)`` 接收它。
 
-        This helper never raises — exceptions are swallowed so it cannot
-        interrupt the retry/fallback logic.
+        此辅助函数从不引发 — 异常被吞噬，因此它不会
+        中断重试/回退逻辑。
         """
         try:
             self._vprint(f"{self.log_prefix}{message}", force=True)
@@ -1948,7 +1955,7 @@ class AIAgent:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
     def _current_main_runtime(self) -> Dict[str, str]:
-        """Return the live main runtime for session-scoped auxiliary routing."""
+        """返回会话范围辅助路由的实时主运行时。"""
         return {
             "model": getattr(self, "model", "") or "",
             "provider": getattr(self, "provider", "") or "",
@@ -1958,18 +1965,18 @@ class AIAgent:
         }
 
     def _check_compression_model_feasibility(self) -> None:
-        """Warn at session start if the auxiliary compression model's context
-        window is smaller than the main model's compression threshold.
+        """如果辅助压缩模型的上下文窗口小于主模型的
+        压缩阈值，则在会话开始时发出警告。
 
-        When the auxiliary model cannot fit the content that needs summarising,
-        compression will either fail outright (the LLM call errors) or produce
-        a severely truncated summary.
+        当辅助模型无法容纳需要总结的内容时，
+        压缩要么完全失败（LLM 调用错误），要么产生
+        严重截断的摘要。
 
-        Called during ``__init__`` so CLI users see the warning immediately
-        (via ``_vprint``).  The gateway sets ``status_callback`` *after*
-        construction, so ``_replay_compression_warning()`` re-sends the
-        stored warning through the callback on the first
-        ``run_conversation()`` call.
+        在 ``__init__`` 期间调用，以便 CLI 用户立即看到警告
+        （通过 ``_vprint``）。网关在构造后设置 ``status_callback``，
+        因此 ``_replay_compression_warning()`` 在第一次
+        ``run_conversation()`` 调用时通过回调重新发送
+        存储的警告。
         """
         if not self.compression_enabled:
             return
@@ -1998,11 +2005,11 @@ class AIAgent:
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
 
-            # Read user-configured context_length for the compression model.
-            # Custom endpoints often don't support /models API queries so
-            # get_model_context_length() falls through to the 128K default,
-            # ignoring the explicit config value.  Pass it as the highest-
-            # priority hint so the configured value is always respected.
+            # 读取压缩模型的用户配置的 context_length。
+            # 自定义端点通常不支持 /models API 查询，因此
+            # get_model_context_length() 会回退到 128K 默认值，
+            # 忽略显式配置值。将其作为最高优先级提示传递，
+            # 以便始终尊重配置的值。
             _aux_cfg = (self.config or {}).get("auxiliary", {}).get("compression", {})
             _aux_context_config = _aux_cfg.get("context_length") if isinstance(_aux_cfg, dict) else None
             if _aux_context_config is not None:
@@ -2020,8 +2027,8 @@ class AIAgent:
 
             threshold = self.context_compressor.threshold_tokens
             if aux_context < threshold:
-                # Suggest a threshold that would fit the aux model,
-                # rounded down to a clean percentage.
+                # 建议一个适合辅助模型的阈值，
+                # 向下取整到干净的百分比。
                 safe_pct = int((aux_context / self.context_compressor.context_length) * 100)
                 msg = (
                     f"⚠ Compression model ({aux_model}) context "
@@ -2057,14 +2064,13 @@ class AIAgent:
             )
 
     def _replay_compression_warning(self) -> None:
-        """Re-send the compression warning through ``status_callback``.
+        """通过 ``status_callback`` 重新发送压缩警告。
 
-        During ``__init__`` the gateway's ``status_callback`` is not yet
-        wired, so ``_emit_status`` only reaches ``_vprint`` (CLI).  This
-        method is called once at the start of the first
-        ``run_conversation()`` — by then the gateway has set the callback,
-        so every platform (Telegram, Discord, Slack, etc.) receives the
-        warning.
+        在 ``__init__`` 期间，网关的 ``status_callback`` 尚未连接，
+        因此 ``_emit_status`` 只能到达 ``_vprint``（CLI）。
+        此方法在第一次 ``run_conversation()`` 开始时调用一次 —
+        到那时网关已设置回调，因此每个平台
+        （Telegram、Discord、Slack 等）都会收到警告。
         """
         msg = getattr(self, "_compression_warning", None)
         if msg and self.status_callback:
@@ -2074,25 +2080,25 @@ class AIAgent:
                 pass
 
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
-        """Return True when a base URL targets OpenAI's native API."""
+        """当基础 URL 目标是 OpenAI 的原生 API 时返回 True。"""
         url = (base_url or self._base_url_lower).lower()
         return "api.openai.com" in url and "openrouter" not in url
 
     def _is_openrouter_url(self) -> bool:
-        """Return True when the base URL targets OpenRouter."""
+        """当基础 URL 目标是 OpenRouter 时返回 True。"""
         return "openrouter" in self._base_url_lower
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
-        """Return True for models that require the Responses API path.
+        """对于需要 Responses API 路径的模型返回 True。
 
-        GPT-5.x models are rejected on /v1/chat/completions by both
-        OpenAI and OpenRouter (error: ``unsupported_api_for_model``).
-        Detect these so the correct api_mode is set regardless of
-        which provider is serving the model.
+        GPT-5.x 模型在 /v1/chat/completions 上被 OpenAI
+        和 OpenRouter 拒绝（错误：``unsupported_api_for_model``）。
+        检测这些模型，以便无论哪个提供商提供模型，
+        都设置正确的 api_mode。
         """
         m = model.lower()
-        # Strip vendor prefix (e.g. "openai/gpt-5.4" → "gpt-5.4")
+        # 去除供应商前缀（例如 "openai/gpt-5.4" → "gpt-5.4"）
         if "/" in m:
             m = m.rsplit("/", 1)[-1]
         return m.startswith("gpt-5")
@@ -2103,24 +2109,24 @@ class AIAgent:
         *,
         provider: Optional[str] = None,
     ) -> bool:
-        """Return True when this provider/model pair should use Responses API."""
+        """当此提供商/模型对应使用 Responses API 时返回 True。"""
         normalized_provider = (provider or "").strip().lower()
         if normalized_provider == "copilot":
             try:
                 from hermes_cli.models import _should_use_copilot_responses_api
                 return _should_use_copilot_responses_api(model)
             except Exception:
-                # Fall back to the generic GPT-5 rule if Copilot-specific
-                # logic is unavailable for any reason.
+                # 如果由于任何原因无法使用 Copilot 特定的
+                # 逻辑，则回退到通用的 GPT-5 规则。
                 pass
         return AIAgent._model_requires_responses_api(model)
 
     def _max_tokens_param(self, value: int) -> dict:
-        """Return the correct max tokens kwarg for the current provider.
+        """返回当前提供商的正确 max tokens 参数。
         
-        OpenAI's newer models (gpt-4o, o-series, gpt-5+) require
-        'max_completion_tokens'. OpenRouter, local models, and older
-        OpenAI models use 'max_tokens'.
+        OpenAI 的较新模型（gpt-4o、o 系列、gpt-5+）需要
+        'max_completion_tokens'。OpenRouter、本地模型和较旧的
+        OpenAI 模型使用 'max_tokens'。
         """
         if self._is_direct_openai_url():
             return {"max_completion_tokens": value}
@@ -2128,22 +2134,22 @@ class AIAgent:
 
     def _has_content_after_think_block(self, content: str) -> bool:
         """
-        Check if content has actual text after any reasoning/thinking blocks.
+        检查内容在任何推理/思考块之后是否有实际文本。
 
-        This detects cases where the model only outputs reasoning but no actual
-        response, which indicates an incomplete generation that should be retried.
-        Must stay in sync with _strip_think_blocks() tag variants.
+        这检测模型仅输出推理但没有实际响应的情况，
+        这表明应该重试的不完整生成。
+        必须与 _strip_think_blocks() 标签变体保持同步。
 
-        Args:
-            content: The assistant message content to check
+        参数：
+            content: 要检查的助手消息内容
 
-        Returns:
-            True if there's meaningful content after think blocks, False otherwise
+        返回：
+            如果思考块后有有意义的内容则为 True，否则为 False
         """
         if not content:
             return False
 
-        # Remove all reasoning tag variants (must match _strip_think_blocks)
+        # 删除所有推理标签变体（必须匹配 _strip_think_blocks）
         cleaned = self._strip_think_blocks(content)
 
         # Check if there's any non-whitespace content remaining
@@ -2168,25 +2174,25 @@ class AIAgent:
         """
         if not content:
             return ""
-        # 1. Closed tag pairs — case-insensitive for all variants so
-        #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
-        #    the unterminated-tag pass and take trailing content with them.
+        # 1. 闭合标签对 — 对所有变体不区分大小写，以便
+        #    混合大小写标签（<THINK>、<Thinking>）不会漏到
+        #    未终止标签传递中并带走尾随内容。
         content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<thinking>.*?</thinking>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<reasoning>.*?</reasoning>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<REASONING_SCRATCHPAD>.*?</REASONING_SCRATCHPAD>', '', content, flags=re.DOTALL | re.IGNORECASE)
         content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        # 2. Unterminated reasoning block — open tag at a block boundary
-        #    (start of text, or after a newline) with no matching close.
-        #    Strip from the tag to end of string.  Fixes #8878 / #9568
-        #    (MiniMax M2.7 leaking raw reasoning into assistant content).
+        # 2. 未终止的推理块 — 块边界的开放标签
+        #    （文本开头或换行后）没有匹配的闭合。
+        #    从标签剥离到字符串结尾。修复 #8878 / #9568
+        #    （MiniMax M2.7 将原始推理泄漏到助手内容中）。
         content = re.sub(
             r'(?:^|\n)[ \t]*<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)\b[^>]*>.*$',
             '',
             content,
             flags=re.DOTALL | re.IGNORECASE,
         )
-        # 3. Stray orphan open/close tags that slipped through.
+        # 3. 漏过的孤立开放/闭合标签。
         content = re.sub(
             r'</?(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>\s*',
             '',
@@ -2197,7 +2203,7 @@ class AIAgent:
 
     @staticmethod
     def _has_natural_response_ending(content: str) -> bool:
-        """Heuristic: does visible assistant text look intentionally finished?"""
+        """启发式：可见助手文本看起来是否故意完成？"""
         if not content:
             return False
         stripped = content.rstrip()
@@ -2208,7 +2214,7 @@ class AIAgent:
         return stripped[-1] in '.!?:)"\']}。！？：）】」』》'
 
     def _is_ollama_glm_backend(self) -> bool:
-        """Detect the narrow backend family affected by Ollama/GLM stop misreports."""
+        """检测受 Ollama/GLM 停止误报影响的窄后端系列。"""
         model_lower = (self.model or "").lower()
         provider_lower = (self.provider or "").lower()
         if "glm" not in model_lower and provider_lower != "zai":
@@ -2223,7 +2229,7 @@ class AIAgent:
         assistant_message,
         messages: Optional[list] = None,
     ) -> bool:
-        """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
+        """检测 Ollama 托管的 GLM 模型的保守 stop->length 误报。"""
         if finish_reason != "stop" or self.api_mode != "chat_completions":
             return False
         if not self._is_ollama_glm_backend():
@@ -2254,7 +2260,7 @@ class AIAgent:
         assistant_content: str,
         messages: List[Dict[str, Any]],
     ) -> bool:
-        """Detect a planning/ack message that should continue instead of ending the turn."""
+        """检测应该继续而不是结束回合的规划/确认消息。"""
         if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
             return False
 
@@ -2322,37 +2328,37 @@ class AIAgent:
     
     def _extract_reasoning(self, assistant_message) -> Optional[str]:
         """
-        Extract reasoning/thinking content from an assistant message.
+        从助手消息中提取推理/思考内容。
         
-        OpenRouter and various providers can return reasoning in multiple formats:
-        1. message.reasoning - Direct reasoning field (DeepSeek, Qwen, etc.)
-        2. message.reasoning_content - Alternative field (Moonshot AI, Novita, etc.)
-        3. message.reasoning_details - Array of {type, summary, ...} objects (OpenRouter unified)
+        OpenRouter 和各种提供商可以以多种格式返回推理：
+        1. message.reasoning - 直接推理字段（DeepSeek、Qwen 等）
+        2. message.reasoning_content - 替代字段（Moonshot AI、Novita 等）
+        3. message.reasoning_details - {type, summary, ...} 对象数组（OpenRouter 统一）
         
-        Args:
-            assistant_message: The assistant message object from the API response
+        参数：
+            assistant_message: 来自 API 响应的助手消息对象
             
-        Returns:
-            Combined reasoning text, or None if no reasoning found
+        返回：
+            合并的推理文本，如果未找到推理则为 None
         """
         reasoning_parts = []
         
-        # Check direct reasoning field
+        # 检查直接推理字段
         if hasattr(assistant_message, 'reasoning') and assistant_message.reasoning:
             reasoning_parts.append(assistant_message.reasoning)
         
-        # Check reasoning_content field (alternative name used by some providers)
+        # 检查 reasoning_content 字段（某些提供商使用的替代名称）
         if hasattr(assistant_message, 'reasoning_content') and assistant_message.reasoning_content:
-            # Don't duplicate if same as reasoning
+            # 如果与 reasoning 相同则不要重复
             if assistant_message.reasoning_content not in reasoning_parts:
                 reasoning_parts.append(assistant_message.reasoning_content)
         
-        # Check reasoning_details array (OpenRouter unified format)
-        # Format: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
+        # 检查 reasoning_details 数组（OpenRouter 统一格式）
+        # 格式：[{"type": "reasoning.summary", "summary": "...", ...}, ...]
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             for detail in assistant_message.reasoning_details:
                 if isinstance(detail, dict):
-                    # Extract summary from reasoning detail object
+                    # 从推理细节对象中提取摘要
                     summary = (
                         detail.get('summary')
                         or detail.get('thinking')
@@ -2362,9 +2368,9 @@ class AIAgent:
                     if summary and summary not in reasoning_parts:
                         reasoning_parts.append(summary)
 
-        # Some providers embed reasoning directly inside assistant content
-        # instead of returning structured reasoning fields.  Only fall back
-        # to inline extraction when no structured reasoning was found.
+        # 一些提供商将推理直接嵌入助手内容中，
+        # 而不是返回结构化推理字段。仅当未找到结构化推理时
+        # 才回退到内联提取。
         content = getattr(assistant_message, "content", None)
         if not reasoning_parts and isinstance(content, str) and content:
             inline_patterns = (
@@ -2381,22 +2387,21 @@ class AIAgent:
                     if cleaned and cleaned not in reasoning_parts:
                         reasoning_parts.append(cleaned)
         
-        # Combine all reasoning parts
+        # 合并所有推理部分
         if reasoning_parts:
             return "\n\n".join(reasoning_parts)
         
         return None
 
     def _cleanup_task_resources(self, task_id: str) -> None:
-        """Clean up VM and browser resources for a given task.
+        """清理给定任务的 VM 和浏览器资源。
 
-        Skips ``cleanup_vm`` when the active terminal environment is marked
-        persistent (``persistent_filesystem=True``) so that long-lived sandbox
-        containers survive between turns. The idle reaper in
-        ``terminal_tool._cleanup_inactive_envs`` still tears them down once
-        ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
-        torn down per-turn as before to prevent resource leakage (the original
-        intent of this hook for the Morph backend, see commit fbd3a2fd).
+        当活动终端环境标记为持久化（``persistent_filesystem=True``）时，
+        跳过 ``cleanup_vm``，以便长期存在的沙箱容器在回合间保持存活。
+        ``terminal_tool._cleanup_inactive_envs`` 中的空闲收割器
+        仍然在超过 ``terminal.lifetime_seconds`` 时拆除它们。
+        非持久化后端像以前一样每回合拆除，以防止资源泄漏
+        （此钩子对 Morph 后端的原始意图，见提交 fbd3a2fd）。
         """
         try:
             if is_persistent_env(task_id):
@@ -2417,42 +2422,42 @@ class AIAgent:
                 logging.warning(f"Failed to cleanup browser for task {task_id}: {e}")
 
     # ------------------------------------------------------------------
-    # Background memory/skill review
+    # 后台内存/技能审查
     # ------------------------------------------------------------------
 
     _MEMORY_REVIEW_PROMPT = (
-        "Review the conversation above and consider saving to memory if appropriate.\n\n"
-        "Focus on:\n"
-        "1. Has the user revealed things about themselves — their persona, desires, "
-        "preferences, or personal details worth remembering?\n"
-        "2. Has the user expressed expectations about how you should behave, their work "
-        "style, or ways they want you to operate?\n\n"
-        "If something stands out, save it using the memory tool. "
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
+        "回顾上面的对话，如果合适的话考虑保存到内存。\n\n"
+        "重点关注：\n"
+        "1. 用户是否透露了关于自己的信息——他们的角色、愿望、\n"
+        "偏好或值得记住的个人细节？\n"
+        "2. 用户是否表达了关于你应该如何行为、他们的工作\n"
+        "风格或他们希望你运行方式的期望？\n\n"
+        "如果有突出的内容，使用内存工具保存它。\n"
+        "如果没有值得保存的内容，只需说'Nothing to save.'然后停止。"
     )
 
     _SKILL_REVIEW_PROMPT = (
-        "Review the conversation above and consider saving or updating a skill if appropriate.\n\n"
-        "Focus on: was a non-trivial approach used to complete a task that required trial "
-        "and error, or changing course due to experiential findings along the way, or did "
-        "the user expect or desire a different method or outcome?\n\n"
-        "If a relevant skill already exists, update it with what you learned. "
-        "Otherwise, create a new skill if the approach is reusable.\n"
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
+        "回顾上面的对话，如果合适的话考虑保存或更新一个技能。\n\n"
+        "重点关注：是否使用了非平凡的方法来完成需要试错的\n"
+        "任务，或者由于过程中的经验发现而改变了方向，或者\n"
+        "用户期望或期望不同的方法或结果？\n\n"
+        "如果相关技能已经存在，请用你学到的内容更新它。\n"
+        "否则，如果方法是可重用的，则创建一个新技能。\n"
+        "如果没有值得保存的内容，只需说'Nothing to save.'然后停止。"
     )
 
     _COMBINED_REVIEW_PROMPT = (
-        "Review the conversation above and consider two things:\n\n"
-        "**Memory**: Has the user revealed things about themselves — their persona, "
-        "desires, preferences, or personal details? Has the user expressed expectations "
-        "about how you should behave, their work style, or ways they want you to operate? "
-        "If so, save using the memory tool.\n\n"
-        "**Skills**: Was a non-trivial approach used to complete a task that required trial "
-        "and error, or changing course due to experiential findings along the way, or did "
-        "the user expect or desire a different method or outcome? If a relevant skill "
-        "already exists, update it. Otherwise, create a new one if the approach is reusable.\n\n"
-        "Only act if there's something genuinely worth saving. "
-        "If nothing stands out, just say 'Nothing to save.' and stop."
+        "回顾上面的对话并考虑两件事：\n\n"
+        "**内存**：用户是否透露了关于自己的信息——他们的角色、\n"
+        "愿望、偏好或个人细节？用户是否表达了关于你应该如何行为、\n"
+        "他们的工作风格或他们希望你运行方式的期望？\n"
+        "如果是这样，使用内存工具保存。\n\n"
+        "**技能**：是否使用了非平凡的方法来完成需要试错的\n"
+        "任务，或者由于过程中的经验发现而改变了方向，或者\n"
+        "用户期望或期望不同的方法或结果？如果相关技能\n"
+        "已经存在，请更新它。否则，如果方法是可重用的，则创建一个新的。\n\n"
+        "只有在有真正值得保存的内容时才行动。\n"
+        "如果没有突出的内容，只需说'Nothing to save.'然后停止。"
     )
 
     def _spawn_background_review(
@@ -2461,16 +2466,23 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
     ) -> None:
-        """Spawn a background thread to review the conversation for memory/skill saves.
+        self.skill_evolution.spawn_background_review(
+            self,
+            messages_snapshot,
+            review_memory=review_memory,
+            review_skills=review_skills,
+        )
+        return
+        """生成后台线程以审查对话以进行内存/技能保存。
 
-        Creates a full AIAgent fork with the same model, tools, and context as the
-        main session. The review prompt is appended as the next user turn in the
-        forked conversation. Writes directly to the shared memory/skill stores.
-        Never modifies the main conversation history or produces user-visible output.
+        创建具有与主会话相同模型、工具和上下文的完整 AIAgent 分支。
+        审查提示作为分支对话中的下一个用户回合附加。
+        直接写入共享的内存/技能存储。
+        从不修改主对话历史或产生用户可见的输出。
         """
         import threading
 
-        # Pick the right prompt based on which triggers fired
+        # 根据触发的触发器选择正确的提示
         if review_memory and review_skills:
             prompt = self._COMBINED_REVIEW_PROMPT
         elif review_memory:
@@ -2503,8 +2515,8 @@ class AIAgent:
                         conversation_history=messages_snapshot,
                     )
 
-                # Scan the review agent's messages for successful tool actions
-                # and surface a compact summary to the user.
+                # 扫描审查代理的消息以查找成功的工具操作
+                # 并向用户显示紧凑的摘要。
                 actions = []
                 for msg in getattr(review_agent, "_session_messages", []):
                     if not isinstance(msg, dict) or msg.get("role") != "tool":
@@ -2544,9 +2556,9 @@ class AIAgent:
             except Exception as e:
                 logger.debug("Background memory/skill review failed: %s", e)
             finally:
-                # Close all resources (httpx client, subprocesses, etc.) so
-                # GC doesn't try to clean them up on a dead asyncio event
-                # loop (which produces "Event loop is closed" errors).
+                # 关闭所有资源（httpx 客户端、子进程等），以便
+                # GC 不会尝试在死掉的 asyncio 事件循环上清理它们
+                # （这会产生"事件循环已关闭"错误）。
                 if review_agent is not None:
                     try:
                         review_agent.close()
@@ -2557,13 +2569,12 @@ class AIAgent:
         t.start()
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
-        """Rewrite the current-turn user message before persistence/return.
+        """在持久化/返回之前重写当前回合的用户消息。
 
-        Some call paths need an API-only user-message variant without letting
-        that synthetic text leak into persisted transcripts or resumed session
-        history. When an override is configured for the active turn, mutate the
-        in-memory messages list in place so both persistence and returned
-        history stay clean.
+        某些调用路径需要仅 API 的用户消息变体，而不让
+        那些合成文本泄漏到持久化的记录或恢复的会话
+        历史中。当为活动回合配置覆盖时，就地修改
+        内存中的消息列表，以便持久化和返回的历史保持干净。
         """
         idx = getattr(self, "_persist_user_message_idx", None)
         override = getattr(self, "_persist_user_message_override", None)
@@ -2575,10 +2586,10 @@ class AIAgent:
                 msg["content"] = override
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
-        """Save session state to both JSON log and SQLite on any exit path.
+        """在任何退出路径上将会话状态保存到 JSON 日志和 SQLite。
 
-        Ensures conversations are never lost, even on errors or early returns.
-        Skipped when ``persist_session=False`` (ephemeral helper flows).
+        确保对话永远不会丢失，即使在错误或提前返回时。
+        当 ``persist_session=False``（临时辅助流程）时跳过。
         """
         if not self.persist_session:
             return
@@ -2588,19 +2599,19 @@ class AIAgent:
         self._flush_messages_to_session_db(messages, conversation_history)
 
     def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
-        """Persist any un-flushed messages to the SQLite session store.
+        """将任何未刷新的消息持久化到 SQLite 会话存储。
 
-        Uses _last_flushed_db_idx to track which messages have already been
-        written, so repeated calls (from multiple exit paths) only write
-        truly new messages — preventing the duplicate-write bug (#860).
+        使用 _last_flushed_db_idx 跟踪哪些消息已经
+        写入，因此重复调用（来自多个退出路径）只写入
+        真正的新消息 — 防止重复写入错误（#860）。
         """
         if not self._session_db:
             return
         self._apply_persist_user_message_override(messages)
         try:
-            # If create_session() failed at startup (e.g. transient lock), the
-            # session row may not exist yet.  ensure_session() uses INSERT OR
-            # IGNORE so it is a no-op when the row is already there.
+            # 如果 create_session() 在启动时失败（例如瞬时锁），
+            # 会话行可能尚不存在。ensure_session() 使用 INSERT OR
+            # IGNORE，因此当行已经存在时它是无操作。
             self._session_db.ensure_session(
                 self.session_id,
                 source=self.platform or "cli",
@@ -2637,22 +2648,21 @@ class AIAgent:
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
-        Get messages up to (but not including) the last assistant turn.
+        获取直到（但不包括）最后一个助手回合的消息。
         
-        This is used when we need to "roll back" to the last successful point
-        in the conversation, typically when the final assistant message is
-        incomplete or malformed.
+        当我们需要"回滚"到对话中最后一个成功点时使用此方法，
+        通常是在最终助手消息不完整或格式错误时。
         
-        Args:
-            messages: Full message list
+        参数：
+            messages: 完整消息列表
             
-        Returns:
-            Messages up to the last complete assistant turn (ending with user/tool message)
+        返回：
+            直到最后一个完整助手回合的消息（以用户/工具消息结束）
         """
         if not messages:
             return []
         
-        # Find the index of the last assistant message
+        # 查找最后一个助手消息的索引
         last_assistant_idx = None
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "assistant":
@@ -2660,23 +2670,23 @@ class AIAgent:
                 break
         
         if last_assistant_idx is None:
-            # No assistant message found, return all messages
+            # 未找到助手消息，返回所有消息
             return messages.copy()
         
-        # Return everything up to (not including) the last assistant message
+        # 返回直到（不包括）最后一个助手消息的所有内容
         return messages[:last_assistant_idx]
     
     def _format_tools_for_system_message(self) -> str:
         """
         Format tool definitions for the system message in the trajectory format.
         
-        Returns:
-            str: JSON string representation of tool definitions
+        返回：
+            str: 工具定义的 JSON 字符串表示
         """
         if not self.tools:
             return "[]"
         
-        # Convert tool definitions to the format expected in trajectories
+        # 将工具定义转换为轨迹中期望的格式
         formatted_tools = []
         for tool in self.tools:
             func = tool["function"]
@@ -2684,7 +2694,7 @@ class AIAgent:
                 "name": func["name"],
                 "description": func.get("description", ""),
                 "parameters": func.get("parameters", {}),
-                "required": None  # Match the format in the example
+                "required": None  # 匹配示例中的格式
             }
             formatted_tools.append(formatted_tool)
         
@@ -2692,19 +2702,19 @@ class AIAgent:
     
     def _convert_to_trajectory_format(self, messages: List[Dict[str, Any]], user_query: str, completed: bool) -> List[Dict[str, Any]]:
         """
-        Convert internal message format to trajectory format for saving.
+        将内部消息格式转换为轨迹格式以进行保存。
         
-        Args:
-            messages (List[Dict]): Internal message history
-            user_query (str): Original user query
-            completed (bool): Whether the conversation completed successfully
+        参数：
+            messages (List[Dict]): 内部消息历史
+            user_query (str): 原始用户查询
+            completed (bool): 对话是否成功完成
             
-        Returns:
-            List[Dict]: Messages in trajectory format
+        返回：
+            List[Dict]: 轨迹格式的消息
         """
         trajectory = []
         
-        # Add system message with tool definitions
+        # 添加带有工具定义的系统消息
         system_msg = (
             "You are a function calling AI model. You are provided with function signatures within <tools> </tools> XML tags. "
             "You may call one or more functions to assist with the user query. If available tools are not relevant in assisting "
@@ -2724,25 +2734,25 @@ class AIAgent:
             "value": system_msg
         })
         
-        # Add the actual user prompt (from the dataset) as the first human message
+        # 将实际的用户提示（来自数据集）添加为第一个人类消息
         trajectory.append({
             "from": "human",
             "value": user_query
         })
         
-        # Skip the first message (the user query) since we already added it above.
-        # Prefill messages are injected at API-call time only (not in the messages
-        # list), so no offset adjustment is needed here.
+        # 跳过第一条消息（用户查询），因为我们已经在上面添加了它。
+        # 预填充消息仅在 API 调用时注入（不在消息列表中），
+        # 因此这里不需要偏移调整。
         i = 1
         
         while i < len(messages):
             msg = messages[i]
             
             if msg["role"] == "assistant":
-                # Check if this message has tool calls
+                # 检查此消息是否有工具调用
                 if "tool_calls" in msg and msg["tool_calls"]:
-                    # Format assistant message with tool calls
-                    # Add <think> tags around reasoning for trajectory storage
+                    # 格式化带有工具调用的助手消息
+                    # 为轨迹存储在推理周围添加 <think> 标签
                     content = ""
                     
                     # Prepend reasoning in <think> tags if available (native thinking tokens)
@@ -2750,20 +2760,20 @@ class AIAgent:
                         content = f"<think>\n{msg['reasoning']}\n</think>\n"
                     
                     if msg.get("content") and msg["content"].strip():
-                        # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
-                        # (used when native thinking is disabled and model reasons via XML)
+                        # 将任何 <REASONING_SCRATCHPAD> 标签转换为 <think> 标签
+                        # （当禁用原生思考且模型通过 XML 推理时使用）
                         content += convert_scratchpad_to_think(msg["content"]) + "\n"
                     
-                    # Add tool calls wrapped in XML tags
+                    # 添加包装在 XML 标签中的工具调用
                     for tool_call in msg["tool_calls"]:
                         if not tool_call or not isinstance(tool_call, dict): continue
-                        # Parse arguments - should always succeed since we validate during conversation
-                        # but keep try-except as safety net
+                        # 解析参数 — 应该总是成功，因为我们在对话期间验证
+                        # 但保留 try-except 作为安全网
                         try:
                             arguments = json.loads(tool_call["function"]["arguments"]) if isinstance(tool_call["function"]["arguments"], str) else tool_call["function"]["arguments"]
                         except json.JSONDecodeError:
-                            # This shouldn't happen since we validate and retry during conversation,
-                            # but if it does, log warning and use empty dict
+                            # 这不应该发生，因为我们在对话期间验证和重试，
+                            # 但如果发生了，记录警告并使用空字典
                             logging.warning(f"Unexpected invalid JSON in trajectory conversion: {tool_call['function']['arguments'][:100]}")
                             arguments = {}
                         
@@ -2773,8 +2783,8 @@ class AIAgent:
                         }
                         content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
                     
-                    # Ensure every gpt turn has a <think> block (empty if no reasoning)
-                    # so the format is consistent for training data
+                    # 确保每个 gpt 回合都有一个 <think> 块（如果没有推理则为空）
+                    # 以便格式对训练数据保持一致
                     if "<think>" not in content:
                         content = "<think>\n</think>\n" + content
                     
@@ -2783,21 +2793,21 @@ class AIAgent:
                         "value": content.rstrip()
                     })
                     
-                    # Collect all subsequent tool responses
+                    # 收集所有后续工具响应
                     tool_responses = []
                     j = i + 1
                     while j < len(messages) and messages[j]["role"] == "tool":
                         tool_msg = messages[j]
-                        # Format tool response with XML tags
+                        # 用 XML 标签格式化工具响应
                         tool_response = "<tool_response>\n"
                         
-                        # Try to parse tool content as JSON if it looks like JSON
+                        # 如果看起来像 JSON，尝试将工具内容解析为 JSON
                         tool_content = tool_msg["content"]
                         try:
                             if tool_content.strip().startswith(("{", "[")):
                                 tool_content = json.loads(tool_content)
                         except (json.JSONDecodeError, AttributeError):
-                            pass  # Keep as string if not valid JSON
+                            pass  # 如果不是有效 JSON 则保持为字符串
                         
                         tool_index = len(tool_responses)
                         tool_name = (
@@ -2814,25 +2824,25 @@ class AIAgent:
                         tool_responses.append(tool_response)
                         j += 1
                     
-                    # Add all tool responses as a single message
+                    # 将所有工具响应添加为单条消息
                     if tool_responses:
                         trajectory.append({
                             "from": "tool",
                             "value": "\n".join(tool_responses)
                         })
-                        i = j - 1  # Skip the tool messages we just processed
+                        i = j - 1  # 跳过我们刚刚处理的工具消息
                 
                 else:
-                    # Regular assistant message without tool calls
-                    # Add <think> tags around reasoning for trajectory storage
+                    # 没有工具调用的常规助手消息
+                    # 为轨迹存储在推理周围添加 <think> 标签
                     content = ""
                     
                     # Prepend reasoning in <think> tags if available (native thinking tokens)
                     if msg.get("reasoning") and msg["reasoning"].strip():
                         content = f"<think>\n{msg['reasoning']}\n</think>\n"
                     
-                    # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
-                    # (used when native thinking is disabled and model reasons via XML)
+                    # 将任何 <REASONING_SCRATCHPAD> 标签转换为 <think> 标签
+                    # （当禁用原生思考且模型通过 XML 推理时使用）
                     raw_content = msg["content"] or ""
                     content += convert_scratchpad_to_think(raw_content)
                     
@@ -2857,12 +2867,12 @@ class AIAgent:
     
     def _save_trajectory(self, messages: List[Dict[str, Any]], user_query: str, completed: bool):
         """
-        Save conversation trajectory to JSONL file.
+        将对话轨迹保存到 JSONL 文件。
         
-        Args:
-            messages (List[Dict]): Complete message history
-            user_query (str): Original user query
-            completed (bool): Whether the conversation completed successfully
+        参数：
+            messages (List[Dict]): 完整消息历史
+            user_query (str): 原始用户查询
+            completed (bool): 对话是否成功完成
         """
         if not self.save_trajectories:
             return
@@ -2872,20 +2882,20 @@ class AIAgent:
     
     @staticmethod
     def _summarize_api_error(error: Exception) -> str:
-        """Extract a human-readable one-liner from an API error.
+        """从 API 错误中提取人类可读的单行摘要。
 
-        Handles Cloudflare HTML error pages (502, 503, etc.) by pulling the
-        <title> tag instead of dumping raw HTML.  Falls back to a truncated
-        str(error) for everything else.
+        通过提取 <title> 标签而不是转储原始 HTML 来处理
+        Cloudflare HTML 错误页面（502、503 等）。
+        对于其他所有情况，回退到截断的 str(error)。
         """
         import re as _re
         raw = str(error)
 
-        # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
+        # Cloudflare / 代理 HTML 页面：获取 <title> 以获得干净的摘要
         if "<!DOCTYPE" in raw or "<html" in raw:
             m = _re.search(r"<title[^>]*>([^<]+)</title>", raw, _re.IGNORECASE)
             title = m.group(1).strip() if m else "HTML error page (title not found)"
-            # Also grab Cloudflare Ray ID if present
+            # 如果存在，也获取 Cloudflare Ray ID
             ray = _re.search(r"Cloudflare Ray ID:\s*<strong[^>]*>([^<]+)</strong>", raw)
             ray_id = ray.group(1).strip() if ray else None
             status_code = getattr(error, "status_code", None)
@@ -2897,7 +2907,7 @@ class AIAgent:
                 parts.append(f"Ray {ray_id}")
             return " — ".join(parts)
 
-        # JSON body errors from OpenAI/Anthropic SDKs
+        # 来自 OpenAI/Anthropic SDK 的 JSON 主体错误
         body = getattr(error, "body", None)
         if isinstance(body, dict):
             msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
@@ -2906,7 +2916,7 @@ class AIAgent:
                 prefix = f"HTTP {status_code}: " if status_code else ""
                 return f"{prefix}{msg[:300]}"
 
-        # Fallback: truncate the raw string but give more room than 200 chars
+        # 回退：截断原始字符串但给予超过 200 个字符的空间
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
         return f"{prefix}{raw[:500]}"
@@ -2920,25 +2930,25 @@ class AIAgent:
 
     def _clean_error_message(self, error_msg: str) -> str:
         """
-        Clean up error messages for user display, removing HTML content and truncating.
+        清理错误消息以供用户显示，删除 HTML 内容并截断。
         
-        Args:
-            error_msg: Raw error message from API or exception
+        参数：
+            error_msg: 来自 API 或异常的原始错误消息
             
-        Returns:
-            Clean, user-friendly error message
+        返回：
+            干净的、用户友好的错误消息
         """
         if not error_msg:
             return "Unknown error"
             
-        # Remove HTML content (common with CloudFlare and gateway error pages)
+        # 删除 HTML 内容（CloudFlare 和网关错误页面常见）
         if error_msg.strip().startswith('<!DOCTYPE html') or '<html' in error_msg:
             return "Service temporarily unavailable (HTML error page returned)"
             
-        # Remove newlines and excessive whitespace
+        # 删除换行符和过多的空白
         cleaned = ' '.join(error_msg.split())
         
-        # Truncate if too long
+        # 如果太长则截断
         if len(cleaned) > 150:
             cleaned = cleaned[:150] + "..."
             
@@ -2946,7 +2956,7 @@ class AIAgent:
 
     @staticmethod
     def _extract_api_error_context(error: Exception) -> Dict[str, Any]:
-        """Extract structured rate-limit details from provider errors."""
+        """从提供商错误中提取结构化的速率限制详细信息。"""
         context: Dict[str, Any] = {}
 
         body = getattr(error, "body", None)
@@ -3010,7 +3020,7 @@ class AIAgent:
         return context
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
-        """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
+        """用于 ``post_api_request`` 插件的令牌桶（没有原始 ``response`` 对象）。"""
         if response is None:
             return None
         raw_usage = getattr(response, "usage", None)
@@ -3033,11 +3043,11 @@ class AIAgent:
         error: Optional[Exception] = None,
     ) -> Optional[Path]:
         """
-        Dump a debug-friendly HTTP request record for the active inference API.
+        为活动推理 API 转储调试友好的 HTTP 请求记录。
 
-        Captures the request body from api_kwargs (excluding transport-only keys
-        like timeout). Intended for debugging provider-side 4xx failures where
-        retries are not useful.
+        从 api_kwargs 捕获请求主体（排除仅传输键
+        如 timeout）。用于调试提供商端 4xx 失败，
+        其中重试没有用。
         """
         try:
             body = copy.deepcopy(api_kwargs)
@@ -3109,7 +3119,7 @@ class AIAgent:
 
     @staticmethod
     def _clean_session_content(content: str) -> str:
-        """Convert REASONING_SCRATCHPAD to think tags and clean up whitespace."""
+        """将 REASONING_SCRATCHPAD 转换为 think 标签并清理空白。"""
         if not content:
             return content
         content = convert_scratchpad_to_think(content)
@@ -3119,22 +3129,22 @@ class AIAgent:
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
         """
-        Save the full raw session to a JSON file.
+        将完整的原始会话保存到 JSON 文件。
 
-        Stores every message exactly as the agent sees it: user messages,
-        assistant messages (with reasoning, finish_reason, tool_calls),
-        tool responses (with tool_call_id, tool_name), and injected system
-        messages (compression summaries, todo snapshots, etc.).
+        完全按照代理看到的方式存储每条消息：用户消息、
+        助手消息（带有推理、finish_reason、tool_calls）、
+        工具响应（带有 tool_call_id、tool_name）和注入的系统
+        消息（压缩摘要、todo 快照等）。
 
-        REASONING_SCRATCHPAD tags are converted to <think> blocks for consistency.
-        Overwritten after each turn so it always reflects the latest state.
+        REASONING_SCRATCHPAD 标签转换为 <think> 块以保持一致性。
+        在每个回合后覆盖，因此它始终反映最新状态。
         """
         messages = messages or self._session_messages
         if not messages:
             return
 
         try:
-            # Clean assistant content for session logs
+            # 清理会话日志的助手内容
             cleaned = []
             for msg in messages:
                 if msg.get("role") == "assistant" and msg.get("content"):
@@ -3142,10 +3152,9 @@ class AIAgent:
                     msg["content"] = self._clean_session_content(msg["content"])
                 cleaned.append(msg)
 
-            # Guard: never overwrite a larger session log with fewer messages.
-            # This protects against data loss when --resume loads a session whose
-            # messages weren't fully written to SQLite — the resumed agent starts
-            # with partial history and would otherwise clobber the full JSON log.
+            # 保护：永远不要用较少的消息覆盖较大的会话日志。
+            # 这防止当 --resume 加载一个其消息未完全写入 SQLite 的会话时的数据丢失
+            # — 恢复的代理以部分历史开始，否则会破坏完整的 JSON 日志。
             if self.session_log_file.exists():
                 try:
                     existing = json.loads(self.session_log_file.read_text(encoding="utf-8"))
@@ -3157,7 +3166,7 @@ class AIAgent:
                         )
                         return
                 except Exception:
-                    pass  # corrupted existing file — allow the overwrite
+                    pass  # 损坏的现有文件 — 允许覆盖
 
             entry = {
                 "session_id": self.session_id,
@@ -3185,51 +3194,50 @@ class AIAgent:
     
     def interrupt(self, message: str = None) -> None:
         """
-        Request the agent to interrupt its current tool-calling loop.
+        请求代理中断其当前的工具调用循环。
         
-        Call this from another thread (e.g., input handler, message receiver)
-        to gracefully stop the agent and process a new message.
+        从另一个线程（例如输入处理程序、消息接收器）调用此方法，
+        以优雅地停止代理并处理新消息。
         
-        Also signals long-running tool executions (e.g. terminal commands)
-        to terminate early, so the agent can respond immediately.
+        还向长时间运行的工具执行（例如终端命令）发出信号
+        以提前终止，以便代理可以立即响应。
         
-        Args:
-            message: Optional new message that triggered the interrupt.
-                     If provided, the agent will include this in its response context.
+        参数：
+            message: 触发中断的可选新消息。
+                     如果提供，代理将将其包含在其响应上下文中。
         
-        Example (CLI):
-            # In a separate input thread:
+        示例（CLI）：
+            # 在单独的输入线程中：
             if user_typed_something:
                 agent.interrupt(user_input)
         
-        Example (Messaging):
-            # When new message arrives for active session:
+        示例（消息传递）：
+            # 当活动会话到达新消息时：
             if session_has_running_agent:
                 running_agent.interrupt(new_message.text)
         """
         self._interrupt_requested = True
         self._interrupt_message = message
-        # Signal all tools to abort any in-flight operations immediately.
-        # Scope the interrupt to this agent's execution thread so other
-        # agents running in the same process (gateway) are not affected.
+        # 向所有工具发出信号以立即中止任何进行中的操作。
+        # 将中断范围限制在此代理的执行线程，以便
+        # 在同一进程（网关）中运行的其他代理不受影响。
         if self._execution_thread_id is not None:
             _set_interrupt(True, self._execution_thread_id)
             self._interrupt_thread_signal_pending = False
         else:
-            # The interrupt arrived before run_conversation() finished
-            # binding the agent to its execution thread. Defer the tool-level
-            # interrupt signal until startup completes instead of targeting
-            # the caller thread by mistake.
+            # 中断在 run_conversation() 完成之前到达，
+            # 将代理绑定到其执行线程。延迟工具级别的
+            # 中断信号，直到启动完成，而不是错误地
+            # 针对调用者线程。
             self._interrupt_thread_signal_pending = True
-        # Fan out to concurrent-tool worker threads.  Those workers run tools
-        # on their own tids (ThreadPoolExecutor workers), so `is_interrupted()`
-        # inside a tool only sees an interrupt when their specific tid is in
-        # the `_interrupted_threads` set.  Without this propagation, an
-        # already-running concurrent tool (e.g. a terminal command hung on
-        # network I/O) never notices the interrupt and has to run to its own
-        # timeout.  See `_run_tool` for the matching entry/exit bookkeeping.
-        # `getattr` fallback covers test stubs that build AIAgent via
-        # object.__new__ and skip __init__.
+        # 扩展到并发工具工作线程。这些工作线程在自己的
+        # tid（ThreadPoolExecutor 工作线程）上运行工具，因此
+        # 工具内的 `is_interrupted()` 只有在它们的特定 tid 在
+        # `_interrupted_threads` 集合中时才会看到中断。
+        # 没有此传播，已经运行的并发工具（例如挂在网络 I/O 上的
+        # 终端命令）永远不会注意到中断，必须运行到自己的
+        # 超时。请参阅 `_run_tool` 了解匹配的进入/退出簿记。
+        # `getattr` 回退覆盖通过 object.__new__ 构建 AIAgent 并跳过 __init__ 的测试存根。
         _tracker = getattr(self, "_tool_worker_threads", None)
         _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
         if _tracker is not None and _tracker_lock is not None:
@@ -3240,7 +3248,7 @@ class AIAgent:
                     _set_interrupt(True, _wtid)
                 except Exception:
                     pass
-        # Propagate interrupt to any running child agents (subagent delegation)
+        # 将中断传播到任何运行的子代理（子代理委托）
         with self._active_children_lock:
             children_copy = list(self._active_children)
         for child in children_copy:
@@ -3252,19 +3260,18 @@ class AIAgent:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
     
     def clear_interrupt(self) -> None:
-        """Clear any pending interrupt request and the per-thread tool interrupt signal."""
+        """清除任何待处理的中断请求和每线程工具中断信号。"""
         self._interrupt_requested = False
         self._interrupt_message = None
         self._interrupt_thread_signal_pending = False
         if self._execution_thread_id is not None:
             _set_interrupt(False, self._execution_thread_id)
-        # Also clear any concurrent-tool worker thread bits.  Tracked
-        # workers normally clear their own bit on exit, but an explicit
-        # clear here guarantees no stale interrupt can survive a turn
-        # boundary and fire on a subsequent, unrelated tool call that
-        # happens to get scheduled onto the same recycled worker tid.
-        # `getattr` fallback covers test stubs that build AIAgent via
-        # object.__new__ and skip __init__.
+        # 同时清除任何并发工具工作线程位。跟踪的
+        # 工作线程通常在退出时清除自己的位，但这里的显式
+        # 清除保证没有过时的中断可以在回合边界后存活
+        # 并在后续的、不相关的工具调用上触发，该调用恰好
+        # 被调度到相同的回收工作线程 tid。
+        # `getattr` 回退覆盖通过 object.__new__ 构建 AIAgent 并跳过 __init__ 的测试存根。
         _tracker = getattr(self, "_tool_worker_threads", None)
         _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
         if _tracker is not None and _tracker_lock is not None:
@@ -3275,10 +3282,10 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
+        # 硬中断取代任何待处理的 /steer — 该引导是为
+        # 代理的下一个工具调用迭代准备的，现在不会
+        # 再发生。删除它而不是在后续回合中通过延迟注入
+        # 惊讶用户。
         _steer_lock = getattr(self, "_pending_steer_lock", None)
         if _steer_lock is not None:
             with _steer_lock:
@@ -3286,30 +3293,29 @@ class AIAgent:
 
     def steer(self, text: str) -> bool:
         """
-        Inject a user message into the next tool result without interrupting.
+        在不中断的情况下将用户消息注入到下一个工具结果中。
 
-        Unlike interrupt(), this does NOT stop the current tool call. The
-        text is stashed and the agent loop appends it to the LAST tool
-        result's content once the current tool batch finishes. The model
-        sees the steer as part of the tool output on its next iteration.
+        与 interrupt() 不同，这不会停止当前的工具调用。
+        文本被存储，代理循环在当前工具批次完成后将其
+        附加到最后一个工具结果的内容中。模型
+        在其下一次迭代中将引导视为工具输出的一部分。
 
-        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
-        before the drain point concatenate with newlines.
+        线程安全：可从网关/CLI/TUI 线程调用。在排放点之前的
+        多次调用用换行符连接。
 
-        Args:
-            text: The user text to inject. Empty strings are ignored.
+        参数：
+            text: 要注入的用户文本。空字符串被忽略。
 
-        Returns:
-            True if the steer was accepted, False if the text was empty.
+        返回：
+            如果引导被接受则为 True，如果文本为空则为 False。
         """
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
-            # Test stubs that built AIAgent via object.__new__ skip __init__.
-            # Fall back to direct attribute set; no concurrent callers expected
-            # in those stubs.
+            # 通过 object.__new__ 构建 AIAgent 的测试存根跳过 __init__。
+            # 回退到直接属性设置；在这些存根中不期望有并发调用者。
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
@@ -3321,10 +3327,10 @@ class AIAgent:
         return True
 
     def _drain_pending_steer(self) -> Optional[str]:
-        """Return the pending steer text (if any) and clear the slot.
+        """返回待处理的引导文本（如果有）并清除插槽。
 
-        Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
+        在附加工具结果后从代理执行线程调用是安全的。
+        当没有待处理的引导时返回 None。
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
@@ -3337,27 +3343,27 @@ class AIAgent:
         return text
 
     def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
-        """Append any pending /steer text to the last tool result in this turn.
+        """将任何待处理的 /steer 文本附加到此回合中最后一个工具结果。
 
-        Called at the end of a tool-call batch, before the next API call.
-        The steer is appended to the last ``role:"tool"`` message's content
-        with a clear marker so the model understands it came from the user
-        and NOT from the tool itself. Role alternation is preserved —
-        nothing new is inserted, we only modify existing content.
+        在工具调用批次结束时、下一次 API 调用之前调用。
+        引导被附加到最后一个 ``role:"tool"`` 消息的内容中，
+        带有清晰的标记，以便模型理解它来自用户
+        而不是来自工具本身。角色交替被保留 —
+        没有插入新内容，我们只修改现有内容。
 
-        Args:
-            messages: The running messages list.
-            num_tool_msgs: Number of tool results appended in this batch;
-                used to locate the tail slice safely.
+        参数：
+            messages: 运行中的消息列表。
+            num_tool_msgs: 此批次中附加的工具结果数量；
+                用于安全定位尾部切片。
         """
         if num_tool_msgs <= 0 or not messages:
             return
         steer_text = self._drain_pending_steer()
         if not steer_text:
             return
-        # Find the last tool-role message in the recent tail. Skipping
-        # non-tool messages defends against future code appending
-        # something else at the boundary.
+        # 在最近的尾部中查找最后一个工具角色消息。
+        # 跳过非工具消息可以防止未来代码在边界处
+        # 附加其他内容。
         target_idx = None
         for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
             msg = messages[j]
@@ -3365,9 +3371,9 @@ class AIAgent:
                 target_idx = j
                 break
         if target_idx is None:
-            # No tool result in this batch (e.g. all skipped by interrupt);
-            # put the steer back so the caller's fallback path can deliver
-            # it as a normal next-turn user message.
+            # 此批次中没有工具结果（例如全部被中断跳过）；
+            # 将引导放回，以便调用者的回退路径可以
+            # 将其作为正常的下一回合用户消息传递。
             _lock = getattr(self, "_pending_steer_lock", None)
             if _lock is not None:
                 with _lock:
@@ -3382,14 +3388,14 @@ class AIAgent:
         marker = f"\n\n[USER STEER (injected mid-run, not tool output): {steer_text}]"
         existing_content = messages[target_idx].get("content", "")
         if not isinstance(existing_content, str):
-            # Anthropic multimodal content blocks — preserve them and append
-            # a text block at the end.
+            # Anthropic 多模态内容块 — 保留它们并在末尾
+            # 附加文本块。
             try:
                 blocks = list(existing_content) if existing_content else []
                 blocks.append({"type": "text", "text": marker.lstrip()})
                 messages[target_idx]["content"] = blocks
             except Exception:
-                # Fall back to string replacement if content shape is unexpected.
+                # 如果内容形状意外，则回退到字符串替换。
                 messages[target_idx]["content"] = f"{existing_content}{marker}"
         else:
             messages[target_idx]["content"] = existing_content + marker
@@ -3400,15 +3406,15 @@ class AIAgent:
         )
 
     def _touch_activity(self, desc: str) -> None:
-        """Update the last-activity timestamp and description (thread-safe)."""
+        """更新最后活动时间戳和描述（线程安全）。"""
         self._last_activity_ts = time.time()
         self._last_activity_desc = desc
 
     def _capture_rate_limits(self, http_response: Any) -> None:
-        """Parse x-ratelimit-* headers from an HTTP response and cache the state.
+        """从 HTTP 响应中解析 x-ratelimit-* 头部并缓存状态。
 
-        Called after each streaming API call.  The httpx Response object is
-        available on the OpenAI SDK Stream via ``stream.response``.
+        在每次流式 API 调用后调用。httpx Response 对象
+        在 OpenAI SDK Stream 上通过 ``stream.response`` 可用。
         """
         if http_response is None:
             return
@@ -3421,17 +3427,17 @@ class AIAgent:
             if state is not None:
                 self._rate_limit_state = state
         except Exception:
-            pass  # Never let header parsing break the agent loop
+            pass  # 永远不要让头部解析破坏代理循环
 
     def get_rate_limit_state(self):
-        """Return the last captured RateLimitState, or None."""
+        """返回最后捕获的 RateLimitState，或 None。"""
         return self._rate_limit_state
 
     def get_activity_summary(self) -> dict:
-        """Return a snapshot of the agent's current activity for diagnostics.
+        """返回代理当前活动的快照以进行诊断。
 
-        Called by the gateway timeout handler to report what the agent was doing
-        when it was killed, and by the periodic "still working" notifications.
+        由网关超时处理程序调用，以报告代理在被杀死时
+        正在做什么，以及由定期的"仍在工作"通知调用。
         """
         elapsed = time.time() - self._last_activity_ts
         return {
@@ -3446,12 +3452,12 @@ class AIAgent:
         }
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
-        """Shut down the memory provider and context engine — call at actual session boundaries.
+        """关闭内存提供商和上下文引擎 — 在实际会话边界调用。
 
-        This calls on_session_end() then shutdown_all() on the memory
-        manager, and on_session_end() on the context engine.
-        NOT called per-turn — only at CLI exit, /reset, gateway
-        session expiry, etc.
+        这会在内存管理器上调用 on_session_end() 然后 shutdown_all()，
+        并在上下文引擎上调用 on_session_end()。
+        不是每回合调用 — 仅在 CLI 退出、/reset、网关
+        会话过期等时调用。
         """
         if self._memory_manager:
             try:
@@ -3462,7 +3468,7 @@ class AIAgent:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
-        # Notify context engine of session end (flush DAG, close DBs, etc.)
+        # 通知上下文引擎会话结束（刷新 DAG、关闭数据库等）
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
                 self.context_compressor.on_session_end(
@@ -3473,10 +3479,10 @@ class AIAgent:
                 pass
     
     def commit_memory_session(self, messages: list = None) -> None:
-        """Trigger end-of-session extraction without tearing providers down.
-        Called when session_id rotates (e.g. /new, context compression);
-        providers keep their state and continue running under the old
-        session_id — they just flush pending extraction now."""
+        """触发会话结束提取而不拆除提供商。
+        当 session_id 轮换时调用（例如 /new、上下文压缩）；
+        提供商保持其状态并在旧的 session_id 下继续运行 —
+        它们现在只是刷新待处理的提取。"""
         if not self._memory_manager:
             return
         try:
@@ -3485,27 +3491,27 @@ class AIAgent:
             pass
 
     def release_clients(self) -> None:
-        """Release LLM client resources WITHOUT tearing down session tool state.
+        """释放 LLM 客户端资源而不拆除会话工具状态。
 
-        Used by the gateway when evicting this agent from _agent_cache for
-        memory-management reasons (LRU cap or idle TTL) — the session may
-        resume at any time with a freshly-built AIAgent that reuses the
-        same task_id / session_id, so we must NOT kill:
-          - process_registry entries for task_id (user's bg shells)
-          - terminal sandbox for task_id (cwd, env, shell state)
-          - browser daemon for task_id (open tabs, cookies)
-          - memory provider (has its own lifecycle; keeps running)
+        当网关出于内存管理原因（LRU 上限或空闲 TTL）
+        从 _agent_cache 驱逐此代理时使用 — 会话可能
+        随时通过重新构建的 AIAgent 恢复，该 AIAgent 重用
+        相同的 task_id / session_id，因此我们绝不能杀死：
+          - task_id 的 process_registry 条目（用户的后台 shell）
+          - task_id 的终端沙箱（cwd、env、shell 状态）
+          - task_id 的浏览器守护进程（打开的标签页、cookies）
+          - 内存提供商（有自己的生命周期；保持运行）
 
-        We DO close:
-          - OpenAI/httpx client pool (big chunk of held memory + sockets;
-            the rebuilt agent gets a fresh client anyway)
-          - Active child subagents (per-turn artefacts; safe to drop)
+        我们确实关闭：
+          - OpenAI/httpx 客户端池（大量持有的内存 + 套接字；
+            重新构建的代理无论如何都会获得新客户端）
+          - 活动的子子代理（每回合的人工制品；可以安全丢弃）
 
-        Safe to call multiple times.  Distinct from close() — which is the
-        hard teardown for actual session boundaries (/new, /reset, session
-        expiry).
+        可以安全多次调用。不同于 close() — 这是
+        实际会话边界（/new、/reset、会话过期）的
+        硬拆除。
         """
-        # Close active child agents (per-turn; no cross-turn persistence).
+        # 关闭活动子代理（每回合；无跨回合持久性）。
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -3514,7 +3520,7 @@ class AIAgent:
                 try:
                     child.release_clients()
                 except Exception:
-                    # Fall back to full close on children; they're per-turn.
+                    # 对子代理回退到完全关闭；它们是每回合的。
                     try:
                         child.close()
                     except Exception:
@@ -3522,7 +3528,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # Close the OpenAI/httpx client to release sockets immediately.
+        # 关闭 OpenAI/httpx 客户端以立即释放套接字。
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3532,42 +3538,42 @@ class AIAgent:
             pass
 
     def close(self) -> None:
-        """Release all resources held by this agent instance.
+        """释放此代理实例持有的所有资源。
 
-        Cleans up subprocess resources that would otherwise become orphans:
-        - Background processes tracked in ProcessRegistry
-        - Terminal sandbox environments
-        - Browser daemon sessions
-        - Active child agents (subagent delegation)
-        - OpenAI/httpx client connections
+        清理否则会成为孤儿的子进程资源：
+        - ProcessRegistry 中跟踪的后台进程
+        - 终端沙箱环境
+        - 浏览器守护进程会话
+        - 活动子代理（子代理委托）
+        - OpenAI/httpx 客户端连接
 
-        Safe to call multiple times (idempotent).  Each cleanup step is
-        independently guarded so a failure in one does not prevent the rest.
+        可以安全多次调用（幂等）。每个清理步骤
+        都是独立保护的，因此一个步骤中的失败不会阻止其余步骤。
         """
         task_id = getattr(self, "session_id", None) or ""
 
-        # 1. Kill background processes for this task
+        # 1. 杀死此任务的后台进程
         try:
             from tools.process_registry import process_registry
             process_registry.kill_all(task_id=task_id)
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
+        # 2. 清理终端沙箱环境
         try:
             from tools.terminal_tool import cleanup_vm
             cleanup_vm(task_id)
         except Exception:
             pass
 
-        # 3. Clean browser daemon sessions
+        # 3. 清理浏览器守护进程会话
         try:
             from tools.browser_tool import cleanup_browser
             cleanup_browser(task_id)
         except Exception:
             pass
 
-        # 4. Close active child agents
+        # 4. 关闭活动子代理
         try:
             with self._active_children_lock:
                 children = list(self._active_children)
@@ -3580,7 +3586,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. 关闭 OpenAI/httpx 客户端
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3591,19 +3597,19 @@ class AIAgent:
 
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
-        Recover todo state from conversation history.
+        从对话历史中恢复 todo 状态。
         
-        The gateway creates a fresh AIAgent per message, so the in-memory
-        TodoStore is empty. We scan the history for the most recent todo
-        tool response and replay it to reconstruct the state.
+        网关为每条消息创建一个新的 AIAgent，因此内存中的
+        TodoStore 是空的。我们扫描历史以查找最近的 todo
+        工具响应并重放它以重建状态。
         """
-        # Walk history backwards to find the most recent todo tool response
+        # 向后遍历历史以查找最近的 todo 工具响应
         last_todo_response = None
         for msg in reversed(history):
             if msg.get("role") != "tool":
                 continue
             content = msg.get("content", "")
-            # Quick check: todo responses contain "todos" key
+            # 快速检查：todo 响应包含 "todos" 键
             if '"todos"' not in content:
                 continue
             try:
@@ -3615,7 +3621,7 @@ class AIAgent:
                 continue
         
         if last_todo_response:
-            # Replay the items into the store (replace mode)
+            # 将项目重放到存储中（替换模式）
             self._todo_store.write(last_todo_response, merge=False)
             if not self.quiet_mode:
                 self._vprint(f"{self.log_prefix}📋 Restored {len(last_todo_response)} todo item(s) from history")
@@ -3623,7 +3629,7 @@ class AIAgent:
     
     @property
     def is_interrupted(self) -> bool:
-        """Check if an interrupt has been requested."""
+        """检查是否已请求中断。"""
         return self._interrupt_requested
 
 
@@ -3637,22 +3643,22 @@ class AIAgent:
 
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
-        Assemble the full system prompt from all layers.
+        从所有层组装完整的系统提示。
         
-        Called once per session (cached on self._cached_system_prompt) and only
-        rebuilt after context compression events. This ensures the system prompt
-        is stable across all turns in a session, maximizing prefix cache hits.
+        每会话调用一次（缓存在 self._cached_system_prompt 上）并且仅在
+        上下文压缩事件后重建。这确保系统提示
+        在会话中的所有回合中保持稳定，最大化前缀缓存命中。
         """
-        # Layers (in order):
-        #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
-        #   2. User / gateway system prompt (if provided)
-        #   3. Persistent memory (frozen snapshot)
-        #   4. Skills guidance (if skills tools are loaded)
-        #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
-        #   6. Current date & time (frozen at build time)
-        #   7. Platform-specific formatting hint
+        # 层（按顺序）：
+        #   1. 代理身份 — SOUL.md（如果可用），否则为 DEFAULT_AGENT_IDENTITY
+        #   2. 用户/网关系统提示（如果提供）
+        #   3. 持久内存（冻结快照）
+        #   4. 技能指导（如果加载了技能工具）
+        #   5. 上下文文件（AGENTS.md、.cursorrules — 当用作身份时此处排除 SOUL.md）
+        #   6. 当前日期和时间（在构建时冻结）
+        #   7. 平台特定的格式提示
 
-        # Try SOUL.md as primary identity (unless context files are skipped)
+        # 尝试将 SOUL.md 作为主要身份（除非跳过上下文文件）
         _soul_loaded = False
         if not self.skip_context_files:
             _soul_content = load_soul_md()
@@ -3661,10 +3667,10 @@ class AIAgent:
                 _soul_loaded = True
 
         if not _soul_loaded:
-            # Fallback to hardcoded identity
+            # 回退到硬编码身份
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
-        # Tool-aware behavioral guidance: only inject when the tools are loaded
+        # 工具感知的行为指导：仅在加载工具时注入
         tool_guidance = []
         if "memory" in self.valid_tool_names:
             tool_guidance.append(MEMORY_GUIDANCE)
@@ -3678,13 +3684,13 @@ class AIAgent:
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
             prompt_parts.append(nous_subscription_prompt)
-        # Tool-use enforcement: tells the model to actually call tools instead
-        # of describing intended actions.  Controlled by config.yaml
+        # 工具使用强制：告诉模型实际调用工具而不是
+        # 描述预期操作。由 config.yaml 控制
         # agent.tool_use_enforcement:
-        #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
-        #   true  — always inject (all models)
-        #   false — never inject
-        #   list  — custom model-name substrings to match
+        #   "auto"（默认）— 匹配 TOOL_USE_ENFORCEMENT_MODELS
+        #   true  — 始终注入（所有模型）
+        #   false — 永不注入
+        #   list  — 要匹配的自定义模型名称子字符串
         if self.valid_tool_names:
             _enforce = self._tool_use_enforcement
             _inject = False
@@ -3702,19 +3708,19 @@ class AIAgent:
             if _inject:
                 prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
                 _model_lower = (self.model or "").lower()
-                # Google model operational guidance (conciseness, absolute
-                # paths, parallel tool calls, verify-before-edit, etc.)
+                # Google 模型操作指导（简洁性、绝对
+                # 路径、并行工具调用、编辑前验证等）
                 if "gemini" in _model_lower or "gemma" in _model_lower:
                     prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-                # OpenAI GPT/Codex execution discipline (tool persistence,
-                # prerequisite checks, verification, anti-hallucination).
+                # OpenAI GPT/Codex 执行纪律（工具持久性、
+                # 先决条件检查、验证、反幻觉）。
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-        # so it can refer the user to them rather than reinventing answers.
+        # 以便它可以向用户引用它们而不是重新发明答案。
 
-        # Note: ephemeral_system_prompt is NOT included here. It's injected at
-        # API-call time only so it stays out of the cached/stored system prompt.
+        # 注意：ephemeral_system_prompt 不包含在这里。它仅在
+        # API 调用时注入，以便它保持在缓存/存储的系统提示之外。
         if system_message is not None:
             prompt_parts.append(system_message)
 
@@ -3723,13 +3729,13 @@ class AIAgent:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
+            # USER.md 在启用时始终包含。
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
 
-        # External memory provider system prompt block (additive to built-in)
+        # 外部内存提供商系统提示块（添加到内置）
         if self._memory_manager:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
@@ -3757,10 +3763,10 @@ class AIAgent:
             prompt_parts.append(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the hermes-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
+            # 在设置时使用 TERMINAL_CWD 进行上下文文件发现（网关
+            # 模式）。网关进程从 hermes-agent 安装目录运行，
+            # 因此 os.getcwd() 会获取仓库的 AGENTS.md 和
+            # 其他开发文件 — 无益地将令牌使用量增加约 10k。
             _context_cwd = os.getenv("TERMINAL_CWD") or None
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
@@ -3778,9 +3784,9 @@ class AIAgent:
             timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
 
-        # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
-        # of the requested model. Inject explicit model identity into the system prompt
-        # so the agent can correctly report which model it is (workaround for API bug).
+        # Alibaba Coding Plan API 始终返回 "glm-4.7" 作为模型名称，无论
+        # 请求的模型是什么。在系统提示中注入显式模型身份，
+        # 以便代理可以正确报告它是什么模型（API 错误的变通方法）。
         if self.provider == "alibaba":
             _model_short = self.model.split("/")[-1] if "/" in self.model else self.model
             prompt_parts.append(
@@ -3790,8 +3796,8 @@ class AIAgent:
                 f"not on any model name returned by the API."
             )
 
-        # Environment hints (WSL, Termux, etc.) — tell the agent about the
-        # execution environment so it can translate paths and adapt behavior.
+        # 环境提示（WSL、Termux 等）— 告诉代理有关
+        # 执行环境的信息，以便它可以转换路径和调整行为。
         _env_hints = build_environment_hints()
         if _env_hints:
             prompt_parts.append(_env_hints)
@@ -3803,12 +3809,12 @@ class AIAgent:
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 
     # =========================================================================
-    # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
+    # 调用前/后护栏（灵感来自 PR #1321 — @alireza78a）
     # =========================================================================
 
     @staticmethod
     def _get_tool_call_id_static(tc) -> str:
-        """Extract call ID from a tool_call entry (dict or object)."""
+        """从 tool_call 条目（字典或对象）中提取调用 ID。"""
         if isinstance(tc, dict):
             return tc.get("id", "") or ""
         return getattr(tc, "id", "") or ""
@@ -3817,13 +3823,12 @@ class AIAgent:
 
     @staticmethod
     def _sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Fix orphaned tool_call / tool_result pairs before every LLM call.
+        """在每次 LLM 调用之前修复孤立的 tool_call / tool_result 对。
 
-        Runs unconditionally — not gated on whether the context compressor
-        is present — so orphans from session loading or manual message
-        manipulation are always caught.
+        无条件运行 — 不取决于上下文压缩器是否存在 —
+        因此会话加载或手动消息操作的孤立项总是被捕获。
         """
-        # --- Role allowlist: drop messages with roles the API won't accept ---
+        # --- 角色允许列表：删除 API 不接受的角色消息 ---
         filtered = []
         for msg in messages:
             role = msg.get("role")
@@ -3851,7 +3856,7 @@ class AIAgent:
                 if cid:
                     result_call_ids.add(cid)
 
-        # 1. Drop tool results with no matching assistant call
+        # 1. 删除没有匹配助手调用的工具结果
         orphaned_results = result_call_ids - surviving_call_ids
         if orphaned_results:
             messages = [
@@ -3863,7 +3868,7 @@ class AIAgent:
                 len(orphaned_results),
             )
 
-        # 2. Inject stub results for calls whose result was dropped
+        # 2. 为结果被删除的调用注入存根结果
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
             patched: List[Dict[str, Any]] = []
@@ -3887,13 +3892,13 @@ class AIAgent:
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
-        """Truncate excess delegate_task calls to max_concurrent_children.
+        """将过多的 delegate_task 调用截断到 max_concurrent_children。
 
-        The delegate_tool caps the task list inside a single call, but the
-        model can emit multiple separate delegate_task tool_calls in one
-        turn.  This truncates the excess, preserving all non-delegate calls.
+        delegate_tool 限制单个调用内的任务列表，但
+        模型可以在一个回合中发出多个独立的 delegate_task tool_calls。
+        这会截断多余的部分，保留所有非委托调用。
 
-        Returns the original list if no truncation was needed.
+        如果不需要截断，则返回原始列表。
         """
         from tools.delegate_tool import _get_max_concurrent_children
         max_children = _get_max_concurrent_children()
@@ -3918,10 +3923,10 @@ class AIAgent:
 
     @staticmethod
     def _deduplicate_tool_calls(tool_calls: list) -> list:
-        """Remove duplicate (tool_name, arguments) pairs within a single turn.
+        """删除单个回合内的重复（tool_name, arguments）对。
 
-        Only the first occurrence of each unique pair is kept.
-        Returns the original list if no duplicates were found.
+        只保留每个唯一对的第一次出现。
+        如果未找到重复项，则返回原始列表。
         """
         seen: set = set()
         unique: list = []
@@ -3935,27 +3940,27 @@ class AIAgent:
         return unique if len(unique) < len(tool_calls) else tool_calls
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
-        """Attempt to repair a mismatched tool name before aborting.
+        """在中止之前尝试修复不匹配的工具名称。
 
-        1. Try lowercase
-        2. Try normalized (lowercase + hyphens/spaces -> underscores)
-        3. Try fuzzy match (difflib, cutoff=0.7)
+        1. 尝试小写
+        2. 尝试标准化（小写 + 连字符/空格 -> 下划线）
+        3. 尝试模糊匹配（difflib，cutoff=0.7）
 
-        Returns the repaired name if found in valid_tool_names, else None.
+        如果在 valid_tool_names 中找到，则返回修复的名称，否则返回 None。
         """
         from difflib import get_close_matches
 
-        # 1. Lowercase
+        # 1. 小写
         lowered = tool_name.lower()
         if lowered in self.valid_tool_names:
             return lowered
 
-        # 2. Normalize
+        # 2. 标准化
         normalized = lowered.replace("-", "_").replace(" ", "_")
         if normalized in self.valid_tool_names:
             return normalized
 
-        # 3. Fuzzy match
+        # 3. 模糊匹配
         matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
         if matches:
             return matches[0]
@@ -3964,17 +3969,17 @@ class AIAgent:
 
     def _invalidate_system_prompt(self):
         """
-        Invalidate the cached system prompt, forcing a rebuild on the next turn.
+        使缓存的系统提示失效，强制在下一回合重建。
         
-        Called after context compression events. Also reloads memory from disk
-        so the rebuilt prompt captures any writes from this session.
+        在上下文压缩事件后调用。同时从磁盘重新加载内存，
+        以便重建的提示捕获此会话的任何写入。
         """
         self._cached_system_prompt = None
         if self._memory_store:
             self._memory_store.load_from_disk()
 
     def _responses_tools(self, tools: Optional[List[Dict[str, Any]]] = None) -> Optional[List[Dict[str, Any]]]:
-        """Convert chat-completions tool schemas to Responses function-tool schemas."""
+        """将 chat-completions 工具架构转换为 Responses 函数工具架构。"""
         source_tools = tools if tools is not None else self.tools
         if not source_tools:
             return None
@@ -3996,11 +4001,11 @@ class AIAgent:
 
     @staticmethod
     def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
-        """Generate a deterministic call_id from tool call content.
+        """从工具调用内容生成确定性 call_id。
 
-        Used as a fallback when the API doesn't provide a call_id.
-        Deterministic IDs prevent cache invalidation — random UUIDs would
-        make every API call's prefix unique, breaking OpenAI's prompt cache.
+        当 API 不提供 call_id 时用作回退。
+        确定性 ID 防止缓存失效 — 随机 UUID 会
+        使每次 API 调用的前缀唯一，破坏 OpenAI 的提示缓存。
         """
         import hashlib
         seed = f"{fn_name}:{arguments}:{index}"
@@ -4009,7 +4014,7 @@ class AIAgent:
 
     @staticmethod
     def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
-        """Split a stored tool id into (call_id, response_item_id)."""
+        """将存储的工具 id 分割为 (call_id, response_item_id)。"""
         if not isinstance(raw_id, str):
             return None, None
         value = raw_id.strip()
@@ -4029,7 +4034,7 @@ class AIAgent:
         call_id: str,
         response_item_id: Optional[str] = None,
     ) -> str:
-        """Build a valid Responses `function_call.id` (must start with `fc_`)."""
+        """构建有效的 Responses `function_call.id`（必须以 `fc_` 开头）。"""
         if isinstance(response_item_id, str):
             candidate = response_item_id.strip()
             if candidate.startswith("fc_"):
@@ -4054,7 +4059,7 @@ class AIAgent:
         return f"fc_{digest}"
 
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Convert internal chat-style messages to Responses input items."""
+        """将内部聊天样式消息转换为 Responses 输入项。"""
         items: List[Dict[str, Any]] = []
         seen_item_ids: set = set()
 
@@ -4070,8 +4075,8 @@ class AIAgent:
                 content_text = str(content) if content is not None else ""
 
                 if role == "assistant":
-                    # Replay encrypted reasoning items from previous turns
-                    # so the API can maintain coherent reasoning chains.
+                    # 重播来自先前回合的加密推理项，
+                    # 以便 API 可以保持连贯的推理链。
                     codex_reasoning = msg.get("codex_reasoning_items")
                     has_codex_reasoning = False
                     if isinstance(codex_reasoning, list):
@@ -4080,10 +4085,10 @@ class AIAgent:
                                 item_id = ri.get("id")
                                 if item_id and item_id in seen_item_ids:
                                     continue
-                                # Strip the "id" field — with store=False the
-                                # Responses API cannot look up items by ID and
-                                # returns 404.  The encrypted_content blob is
-                                # self-contained for reasoning chain continuity.
+                                # 剥离 "id" 字段 — 使用 store=False 时，
+                                # Responses API 无法通过 ID 查找项并
+                                # 返回 404。encrypted_content blob 是
+                                # 自包含的，用于推理链连续性。
                                 replay_item = {k: v for k, v in ri.items() if k != "id"}
                                 items.append(replay_item)
                                 if item_id:
@@ -4093,11 +4098,10 @@ class AIAgent:
                     if content_text.strip():
                         items.append({"role": "assistant", "content": content_text})
                     elif has_codex_reasoning:
-                        # The Responses API requires a following item after each
-                        # reasoning item (otherwise: missing_following_item error).
-                        # When the assistant produced only reasoning with no visible
-                        # content, emit an empty assistant message as the required
-                        # following item.
+                        # Responses API 在每个推理项之后需要一个后续项
+                        # （否则：missing_following_item 错误）。
+                        # 当助手仅产生推理而没有可见内容时，
+                        # 发出空助手消息作为所需的后续项。
                         items.append({"role": "assistant", "content": ""})
 
                     tool_calls = msg.get("tool_calls")
@@ -4226,10 +4230,10 @@ class AIAgent:
                             continue
                         seen_ids.add(item_id)
                     reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
-                    # Do NOT include the "id" in the outgoing item — with
-                    # store=False (our default) the API tries to resolve the
-                    # id server-side and returns 404.  The id is still used
-                    # above for local deduplication via seen_ids.
+                    # 不要在传出项中包含 "id" — 使用
+                    # store=False（我们的默认值）时，API 尝试
+                    # 服务器端解析 id 并返回 404。id 仍然在
+                    # 上面用于通过 seen_ids 进行本地去重。
                     summary = item.get("summary")
                     if isinstance(summary, list):
                         reasoning_item["summary"] = summary
@@ -4341,7 +4345,7 @@ class AIAgent:
         if normalized_tools is not None:
             normalized["tools"] = normalized_tools
 
-        # Pass through reasoning config
+        # 传递推理配置
         reasoning = api_kwargs.get("reasoning")
         if isinstance(reasoning, dict):
             normalized["reasoning"] = reasoning
@@ -4352,7 +4356,7 @@ class AIAgent:
         if isinstance(service_tier, str) and service_tier.strip():
             normalized["service_tier"] = service_tier.strip()
 
-        # Pass through max_output_tokens and temperature
+        # 传递 max_output_tokens 和 temperature
         max_output_tokens = api_kwargs.get("max_output_tokens")
         if isinstance(max_output_tokens, (int, float)) and max_output_tokens > 0:
             normalized["max_output_tokens"] = int(max_output_tokens)
@@ -4360,7 +4364,7 @@ class AIAgent:
         if isinstance(temperature, (int, float)):
             normalized["temperature"] = float(temperature)
 
-        # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
+        # 传递 tool_choice、parallel_tool_calls、prompt_cache_key
         for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):
             val = api_kwargs.get(passthrough_key)
             if val is not None:
@@ -4399,7 +4403,7 @@ class AIAgent:
         return normalized
 
     def _extract_responses_message_text(self, item: Any) -> str:
-        """Extract assistant text from a Responses message output item."""
+        """从 Responses 消息输出项中提取助手文本。"""
         content = getattr(item, "content", None)
         if not isinstance(content, list):
             return ""
@@ -4415,7 +4419,7 @@ class AIAgent:
         return "".join(chunks).strip()
 
     def _extract_responses_reasoning_text(self, item: Any) -> str:
-        """Extract a compact reasoning text from a Responses reasoning item."""
+        """从 Responses 推理项中提取紧凑的推理文本。"""
         summary = getattr(item, "summary", None)
         if isinstance(summary, list):
             chunks: List[str] = []
@@ -4431,12 +4435,11 @@ class AIAgent:
         return ""
 
     def _normalize_codex_response(self, response: Any) -> tuple[Any, str]:
-        """Normalize a Responses API object to an assistant_message-like object."""
+        """将 Responses API 对象标准化为类似 assistant_message 的对象。"""
         output = getattr(response, "output", None)
         if not isinstance(output, list) or not output:
-            # The Codex backend can return empty output when the answer was
-            # delivered entirely via stream events. Check output_text as a
-            # last-resort fallback before raising.
+            # 当答案完全通过流事件传递时，Codex 后端可以返回空输出。
+            # 在引发之前检查 output_text 作为最后的回退。
             out_text = getattr(response, "output_text", None)
             if isinstance(out_text, str) and out_text.strip():
                 logger.debug(
@@ -4499,16 +4502,16 @@ class AIAgent:
                 reasoning_text = self._extract_responses_reasoning_text(item)
                 if reasoning_text:
                     reasoning_parts.append(reasoning_text)
-                # Capture the full reasoning item for multi-turn continuity.
-                # encrypted_content is an opaque blob the API needs back on
-                # subsequent turns to maintain coherent reasoning chains.
+                # 捕获完整的推理项以实现多回合连续性。
+                # encrypted_content 是 API 在后续回合中需要返回的
+                # 不透明 blob，以保持连贯的推理链。
                 encrypted = getattr(item, "encrypted_content", None)
                 if isinstance(encrypted, str) and encrypted:
                     raw_item = {"type": "reasoning", "encrypted_content": encrypted}
                     item_id = getattr(item, "id", None)
                     if isinstance(item_id, str) and item_id:
                         raw_item["id"] = item_id
-                    # Capture summary — required by the API when replaying reasoning items
+                    # 捕获摘要 — API 在重播推理项时需要
                     summary = getattr(item, "summary", None)
                     if isinstance(summary, list):
                         raw_summary = []
@@ -4583,12 +4586,12 @@ class AIAgent:
         elif has_incomplete_items or (saw_commentary_phase and not saw_final_answer_phase):
             finish_reason = "incomplete"
         elif reasoning_items_raw and not final_text:
-            # Response contains only reasoning (encrypted thinking state) with
-            # no visible content or tool calls.  The model is still thinking and
-            # needs another turn to produce the actual answer.  Marking this as
-            # "stop" would send it into the empty-content retry loop which burns
-            # 3 retries then fails — treat it as incomplete instead so the Codex
-            # continuation path handles it correctly.
+            # 响应仅包含推理（加密思考状态），没有
+            # 可见内容或工具调用。模型仍在思考中，
+            # 需要另一个回合来产生实际答案。
+            # 将其标记为 "stop" 会将其发送到空内容重试循环，
+            # 该循环消耗 3 次重试然后失败 — 将其视为不完整，
+            # 以便 Codex 延续路径正确处理它。
             finish_reason = "incomplete"
         else:
             finish_reason = "stop"
@@ -4616,14 +4619,14 @@ class AIAgent:
 
     @staticmethod
     def _is_openai_client_closed(client: Any) -> bool:
-        """Check if an OpenAI client is closed.
+        """检查 OpenAI 客户端是否关闭。
 
-        Handles both property and method forms of is_closed:
-        - httpx.Client.is_closed is a bool property
-        - openai.OpenAI.is_closed is a method returning bool
+        处理 is_closed 的属性和方法形式：
+        - httpx.Client.is_closed 是布尔属性
+        - openai.OpenAI.is_closed 是返回布尔值的方法
 
-        Prior bug: getattr(client, "is_closed", False) returned the bound method,
-        which is always truthy, causing unnecessary client recreation on every call.
+        先前的错误：getattr(client, "is_closed", False) 返回了绑定方法，
+        该方法始终为真，导致每次调用时不必要地重新创建客户端。
         """
         from unittest.mock import Mock
 
@@ -4632,7 +4635,7 @@ class AIAgent:
 
         is_closed_attr = getattr(client, "is_closed", None)
         if is_closed_attr is not None:
-            # Handle method (openai SDK) vs property (httpx)
+            # 处理方法（openai SDK）与属性（httpx）
             if callable(is_closed_attr):
                 if is_closed_attr():
                     return True
@@ -4646,14 +4649,15 @@ class AIAgent:
 
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
         from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
-        # Treat client_kwargs as read-only. Callers pass self._client_kwargs (or shallow
-        # copies of it) in; any in-place mutation leaks back into the stored dict and is
-        # reused on subsequent requests. #10933 hit this by injecting an httpx.Client
-        # transport that was torn down after the first request, so the next request
-        # wrapped a closed transport and raised "Cannot send a request, as the client
-        # has been closed" on every retry. The revert resolved that specific path; this
-        # copy locks the contract so future transport/keepalive work can't reintroduce
-        # the same class of bug.
+        # 将 client_kwargs 视为只读。调用者传入 self._client_kwargs（或其浅表
+        # 副本）；任何就地变异会泄漏回存储的字典并在
+        # 后续请求中重用。#10933 通过注入一个 httpx.Client
+        # 传输来解决这个问题，该传输在第一次请求后被拆除，因此
+        # 下一个请求包装了一个关闭的传输并在每次重试时
+        # 引发"Cannot send a request, as the client has been closed"。
+        # 撤销解决了该特定路径；此副本锁定了合同，
+        # 因此未来的传输/keepalive 工作不能重新引入
+        # 同类错误。
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
@@ -4671,7 +4675,7 @@ class AIAgent:
         if self.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
             from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
 
-            # Strip OpenAI-specific kwargs the Gemini client doesn't accept
+            # 剥离 Gemini 客户端不接受的 OpenAI 特定 kwargs
             safe_kwargs = {
                 k: v for k, v in client_kwargs.items()
                 if k in {"api_key", "base_url", "default_headers", "project_id", "timeout"}
@@ -4684,23 +4688,23 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
-        # Inject TCP keepalives so the kernel detects dead provider connections
-        # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
-        # this, a peer that drops mid-stream leaves the socket in a state where
-        # epoll_wait never fires, ``httpx`` read timeout may not trigger, and
-        # the agent hangs until manually killed.  Probes after 30s idle, retry
-        # every 10s, give up after 3 → dead peer detected within ~60s.
+        # 注入 TCP keepalives 以便内核检测死连接的提供商连接，
+        # 而不是让它们在 CLOSE-WAIT 中静默挂起（#10324）。
+        # 没有这个，在流中途断开的对等方会将套接字留在一种状态，
+        # 其中 epoll_wait 永远不会触发，``httpx`` 读取超时可能不会触发，
+        # 并且代理会挂起直到手动杀死。空闲 30 秒后探测，
+        # 每 10 秒重试一次，3 次后放弃 → 在约 60 秒内检测到死对等方。
         #
-        # Safety against #10933: the ``client_kwargs = dict(client_kwargs)``
-        # above means this injection only lands in the local per-call copy,
-        # never back into ``self._client_kwargs``.  Each ``_create_openai_client``
-        # invocation therefore gets its OWN fresh ``httpx.Client`` whose
-        # lifetime is tied to the OpenAI client it is passed to.  When the
-        # OpenAI client is closed (rebuild, teardown, credential rotation),
-        # the paired ``httpx.Client`` closes with it, and the next call
-        # constructs a fresh one — no stale closed transport can be reused.
-        # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
-        # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
+        # 针对 #10933 的安全性：上面的 ``client_kwargs = dict(client_kwargs)``
+        # 意味着此注入仅落在本地每次调用副本中，
+        # 永远不会回到 ``self._client_kwargs``。因此每次 ``_create_openai_client``
+        # 调用都会获得其自己的新鲜 ``httpx.Client``，其
+        # 生命周期与传递给它的 OpenAI 客户端绑定。当
+        # OpenAI 客户端关闭（重建、拆除、凭证轮换）时，
+        # 配对的 ``httpx.Client`` 随之关闭，下一次调用
+        # 构建一个新的 — 不能重用陈旧的关闭传输。
+        # ``tests/run_agent/test_create_openai_client_reuse.py`` 和
+        # ``tests/run_agent/test_sequential_chats_live.py`` 中的测试固定了此不变量。
         if "http_client" not in client_kwargs:
             try:
                 import httpx as _httpx
@@ -4718,7 +4722,7 @@ class AIAgent:
                     transport=_httpx.HTTPTransport(socket_options=_sock_opts),
                 )
             except Exception:
-                pass  # Fall through to default transport if socket opts fail
+                pass  # 如果套接字选项失败，则回退到默认传输
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
@@ -4730,15 +4734,15 @@ class AIAgent:
 
     @staticmethod
     def _force_close_tcp_sockets(client: Any) -> int:
-        """Force-close underlying TCP sockets to prevent CLOSE-WAIT accumulation.
+        """强制关闭底层 TCP 套接字以防止 CLOSE-WAIT 累积。
 
-        When a provider drops a connection mid-stream, httpx's ``client.close()``
-        performs a graceful shutdown which leaves sockets in CLOSE-WAIT until the
-        OS times them out (often minutes).  This method walks the httpx transport
-        pool and issues ``socket.shutdown(SHUT_RDWR)`` + ``socket.close()`` to
-        force an immediate TCP RST, freeing the file descriptors.
+        当提供商在流中途断开连接时，httpx 的 ``client.close()``
+        执行优雅关闭，将套接字留在 CLOSE-WAIT 中，直到
+        OS 超时（通常几分钟）。此方法遍历 httpx 传输
+        池并发出 ``socket.shutdown(SHUT_RDWR)`` + ``socket.close()`` 以
+        强制立即 TCP RST，释放文件描述符。
 
-        Returns the number of sockets force-closed.
+        返回强制关闭的套接字数量。
         """
         import socket as _socket
 
@@ -4753,8 +4757,8 @@ class AIAgent:
             pool = getattr(transport, "_pool", None)
             if pool is None:
                 return 0
-            # httpx uses httpcore connection pools; connections live in
-            # _connections (list) or _pool (list) depending on version.
+            # httpx 使用 httpcore 连接池；连接位于
+            # _connections（列表）或 _pool（列表）中，取决于版本。
             connections = (
                 getattr(pool, "_connections", None)
                 or getattr(pool, "_pool", None)
@@ -4790,8 +4794,8 @@ class AIAgent:
     def _close_openai_client(self, client: Any, *, reason: str, shared: bool) -> None:
         if client is None:
             return
-        # Force-close TCP sockets first to prevent CLOSE-WAIT accumulation,
-        # then do the graceful SDK-level close.
+        # 首先强制关闭 TCP 套接字以防止 CLOSE-WAIT 累积，
+        # 然后执行优雅的 SDK 级别关闭。
         force_closed = self._force_close_tcp_sockets(client)
         try:
             client.close()
@@ -4845,13 +4849,13 @@ class AIAgent:
             return self.client
 
     def _cleanup_dead_connections(self) -> bool:
-        """Detect and clean up dead TCP connections on the primary client.
+        """检测并清理主客户端上的死 TCP 连接。
 
-        Inspects the httpx connection pool for sockets in unhealthy states
-        (CLOSE-WAIT, errors).  If any are found, force-closes all sockets
-        and rebuilds the primary client from scratch.
+        检查 httpx 连接池中处于不健康状态的套接字
+        （CLOSE-WAIT、错误）。如果发现任何，则强制关闭所有套接字
+        并从头开始重建主客户端。
 
-        Returns True if dead connections were found and cleaned up.
+        如果发现并清理了死连接，则返回 True。
         """
         client = getattr(self, "client", None)
         if client is None:
@@ -4873,7 +4877,7 @@ class AIAgent:
             )
             dead_count = 0
             for conn in list(connections):
-                # Check for connections that are idle but have closed sockets
+                # 检查空闲但已关闭套接字的连接
                 stream = (
                     getattr(conn, "_network_stream", None)
                     or getattr(conn, "_stream", None)
@@ -4887,7 +4891,7 @@ class AIAgent:
                         sock = getattr(sock, "_sock", None)
                 if sock is None:
                     continue
-                # Probe socket health with a non-blocking recv peek
+                # 使用非阻塞 recv peek 探测套接字健康状况
                 import socket as _socket
                 try:
                     sock.setblocking(False)
@@ -4895,7 +4899,7 @@ class AIAgent:
                     if data == b"":
                         dead_count += 1
                 except BlockingIOError:
-                    pass  # No data available — socket is healthy
+                    pass  # 没有可用数据 — 套接字健康
                 except OSError:
                     dead_count += 1
                 finally:
@@ -4928,16 +4932,16 @@ class AIAgent:
         self._close_openai_client(client, reason=reason, shared=False)
 
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
-        """Execute one streaming Responses API request and return the final response."""
+        """执行一个流式 Responses API 请求并返回最终响应。"""
         import httpx as _httpx
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
-        # Accumulate streamed text so we can recover if get_final_response()
-        # returns empty output (e.g. chatgpt.com backend-api sends
-        # response.incomplete instead of response.completed).
+        # 累积流式文本，以便在 get_final_response()
+        # 返回空输出时我们可以恢复（例如 chatgpt.com backend-api 发送
+        # response.incomplete 而不是 response.completed）。
         self._codex_streamed_text_parts: list = []
         for attempt in range(max_stream_retries + 1):
             collected_output_items: list = []
@@ -4948,7 +4952,7 @@ class AIAgent:
                         if self._interrupt_requested:
                             break
                         event_type = getattr(event, "type", "")
-                        # Fire callbacks on text content deltas (suppress during tool calls)
+                        # 在文本内容增量上触发回调（在工具调用期间抑制）
                         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                             delta_text = getattr(event, "delta", "")
                             if delta_text:
@@ -4962,23 +4966,23 @@ class AIAgent:
                                         except Exception:
                                             pass
                                 self._fire_stream_delta(delta_text)
-                        # Track tool calls to suppress text streaming
+                        # 跟踪工具调用以抑制文本流式传输
                         elif "function_call" in event_type:
                             has_tool_calls = True
-                        # Fire reasoning callbacks
+                        # 触发推理回调
                         elif "reasoning" in event_type and "delta" in event_type:
                             reasoning_text = getattr(event, "delta", "")
                             if reasoning_text:
                                 self._fire_reasoning_delta(reasoning_text)
-                        # Collect completed output items — some backends
-                        # (chatgpt.com/backend-api/codex) stream valid items
-                        # via response.output_item.done but the SDK's
-                        # get_final_response() returns an empty output list.
+                        # 收集已完成的输出项 — 某些后端
+                        # （chatgpt.com/backend-api/codex）通过 response.output_item.done
+                        # 流式传输有效项，但 SDK 的
+                        # get_final_response() 返回空输出列表。
                         elif event_type == "response.output_item.done":
                             done_item = getattr(event, "item", None)
                             if done_item is not None:
                                 collected_output_items.append(done_item)
-                        # Log non-completed terminal events for diagnostics
+                        # 记录未完成的终端事件以进行诊断
                         elif event_type in ("response.incomplete", "response.failed"):
                             resp_obj = getattr(event, "response", None)
                             status = getattr(resp_obj, "status", None) if resp_obj else None
@@ -4991,9 +4995,9 @@ class AIAgent:
                                 self._client_log_context(),
                             )
                     final_response = stream.get_final_response()
-                    # PATCH: ChatGPT Codex backend streams valid output items
-                    # but get_final_response() can return an empty output list.
-                    # Backfill from collected items or synthesize from deltas.
+                    # 补丁：ChatGPT Codex 后端流式传输有效输出项
+                    # 但 get_final_response() 可以返回空输出列表。
+                    # 从收集的项回填或从增量合成。
                     _out = getattr(final_response, "output", None)
                     if isinstance(_out, list) and not _out:
                         if collected_output_items:
@@ -5051,14 +5055,14 @@ class AIAgent:
                 raise
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
-        """Fallback path for stream completion edge cases on Codex-style Responses backends."""
+        """Codex 风格 Responses 后端上流完成边缘情况的回退路径。"""
         active_client = client or self._ensure_primary_openai_client(reason="codex_create_stream_fallback")
         fallback_kwargs = dict(api_kwargs)
         fallback_kwargs["stream"] = True
         fallback_kwargs = self._preflight_codex_api_kwargs(fallback_kwargs, allow_stream=True)
         stream_or_response = active_client.responses.create(**fallback_kwargs)
 
-        # Compatibility shim for mocks or providers that still return a concrete response.
+        # 仍然返回具体响应的模拟或提供商的兼容性填充。
         if hasattr(stream_or_response, "output"):
             return stream_or_response
         if not hasattr(stream_or_response, "__iter__"):
@@ -5074,7 +5078,7 @@ class AIAgent:
                 if not event_type and isinstance(event, dict):
                     event_type = event.get("type")
 
-                # Collect output items and text deltas for backfill
+                # 收集输出项和文本增量以进行回填
                 if event_type == "response.output_item.done":
                     done_item = getattr(event, "item", None)
                     if done_item is None and isinstance(event, dict):
@@ -5095,7 +5099,7 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
-                    # Backfill empty output from collected stream events
+                    # 从收集的流事件回填空输出
                     _out = getattr(terminal_response, "output", None)
                     if isinstance(_out, list) and not _out:
                         if collected_output_items:
@@ -5184,7 +5188,7 @@ class AIAgent:
         self.base_url = base_url.strip().rstrip("/")
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
-        # Nous requests should not inherit OpenRouter-only attribution headers.
+        # Nous 请求不应继承仅 OpenRouter 的归属头部。
         self._client_kwargs.pop("default_headers", None)
 
         if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
@@ -5195,8 +5199,8 @@ class AIAgent:
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
             return False
-        # Only refresh credentials for the native Anthropic provider.
-        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
+        # 仅为本机 Anthropic 提供商刷新凭证。
+        # 其他 anthropic_messages 提供商（MiniMax、Alibaba 等）使用自己的密钥。
         if self.provider != "anthropic":
             return False
 
@@ -5226,7 +5230,7 @@ class AIAgent:
             return False
 
         self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth)
+        # 更新 OAuth 标志 — 令牌类型可能已更改（API 密钥 ↔ OAuth）
         from agent.anthropic_adapter import _is_oauth_token
         self._is_anthropic_oauth = _is_oauth_token(new_token)
         return True
@@ -5283,19 +5287,18 @@ class AIAgent:
         classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
     ) -> tuple[bool, bool]:
-        """Attempt credential recovery via pool rotation.
+        """通过池轮换尝试凭证恢复。
 
-        Returns (recovered, has_retried_429).
-        On rate limits: first occurrence retries same credential (sets flag True).
-                        second consecutive failure rotates to next credential.
-        On billing exhaustion: immediately rotates.
-        On auth failures: attempts token refresh before rotating.
+        返回 (recovered, has_retried_429)。
+        速率限制：首次出现重试相同凭证（设置标志 True）。
+                    连续第二次失败轮换到下一个凭证。
+        计费耗尽：立即轮换。
+        认证失败：在轮换前尝试令牌刷新。
 
-        `classified_reason` lets the recovery path honor the structured error
-        classifier instead of relying only on raw HTTP codes. This matters for
-        providers that surface billing/rate-limit/auth conditions under a
-        different status code, such as Anthropic returning HTTP 400 for
-        "out of extra usage".
+        `classified_reason` 让恢复路径尊重结构化错误
+        分类器，而不是仅依赖原始 HTTP 代码。这对于
+        在不同状态代码下暴露计费/速率限制/认证条件的提供商很重要，
+        例如 Anthropic 为"额外使用量不足"返回 HTTP 400。
         """
         pool = self._credential_pool
         if pool is None:
@@ -5344,8 +5347,8 @@ class AIAgent:
                 logger.info(f"Credential auth failure — refreshed pool entry {getattr(refreshed, 'id', '?')}")
                 self._swap_credential(refreshed)
                 return True, has_retried_429
-            # Refresh failed — rotate to next credential instead of giving up.
-            # The failed entry is already marked exhausted by try_refresh_current().
+            # 刷新失败 — 轮换到下一个凭证而不是放弃。
+            # 失败的条目已被 try_refresh_current() 标记为耗尽。
             rotate_status = status_code if status_code is not None else 401
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
             if next_entry is not None:
@@ -5366,17 +5369,17 @@ class AIAgent:
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
-        Run the API call in a background thread so the main conversation loop
-        can detect interrupts without waiting for the full HTTP round-trip.
+        在后台线程中运行 API 调用，以便主对话循环
+        可以检测中断而无需等待完整的 HTTP 往返。
 
-        Each worker thread gets its own OpenAI client instance. Interrupts only
-        close that worker-local client, so retries and other requests never
-        inherit a closed transport.
+        每个工作线程都有自己的 OpenAI 客户端实例。
+        中断仅关闭该工作线程本地客户端，因此重试和其他请求
+        永远不会继承关闭的传输。
 
-        Includes a stale-call detector: if no response arrives within the
-        configured timeout, the connection is killed and an error raised so
-        the main retry loop can try again with backoff / credential rotation /
-        provider fallback.
+        包括陈旧调用检测器：如果在配置的超时内
+        没有响应到达，则终止连接并引发错误，
+        以便主重试循环可以尝试使用退避/凭证轮换/
+        提供商回退。
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
@@ -5393,7 +5396,7 @@ class AIAgent:
                 elif self.api_mode == "anthropic_messages":
                     result["response"] = self._anthropic_messages_create(api_kwargs)
                 elif self.api_mode == "bedrock_converse":
-                    # Bedrock uses boto3 directly — no OpenAI client needed.
+                    # Bedrock 直接使用 boto3 — 不需要 OpenAI 客户端。
                     from agent.bedrock_adapter import (
                         _get_bedrock_runtime_client,
                         normalize_converse_response,
@@ -5413,12 +5416,12 @@ class AIAgent:
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="request_complete")
 
-        # ── Stale-call timeout (mirrors streaming stale detector) ────────
-        # Non-streaming calls return nothing until the full response is
-        # ready.  Without this, a hung provider can block for the full
-        # httpx timeout (default 1800s) with zero feedback.  The stale
-        # detector kills the connection early so the main retry loop can
-        # apply richer recovery (credential rotation, provider fallback).
+        # ── 陈旧调用超时（镜像流式陈旧检测器） ────────
+        # 非流式调用在完整响应准备就绪之前不返回任何内容。
+        # 没有这个，挂起的提供商可以阻塞完整的
+        # httpx 超时（默认 1800 秒）而没有任何反馈。
+        # 陈旧检测器提前终止连接，以便主重试循环
+        # 可以应用更丰富的恢复（凭证轮换、提供商回退）。
         _stale_base = float(os.getenv("HERMES_API_CALL_STALE_TIMEOUT", 300.0))
         _base_url = getattr(self, "_base_url", None) or ""
         if _stale_base == 300.0 and _base_url and is_local_endpoint(_base_url):
@@ -5442,16 +5445,16 @@ class AIAgent:
             t.join(timeout=0.3)
             _poll_count += 1
 
-            # Touch activity every ~30s so the gateway's inactivity
-            # monitor knows we're alive while waiting for the response.
+            # 每 ~30 秒触摸一次活动，以便网关的非活动
+            # 监视器知道我们在等待响应时仍然存活。
             if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
                 _elapsed = time.time() - _call_start
                 self._touch_activity(
                     f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
                 )
 
-            # Stale-call detector: kill the connection if no response
-            # arrives within the configured timeout.
+            # 陈旧调用检测器：如果在配置的超时内
+            # 没有响应到达，则终止连接。
             _elapsed = time.time() - _call_start
             if _elapsed > _stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
@@ -5494,9 +5497,9 @@ class AIAgent:
                 break
 
             if self._interrupt_requested:
-                # Force-close the in-flight worker-local HTTP connection to stop
-                # token generation without poisoning the shared client used to
-                # seed future retries.
+                # 强制关闭进行中的工作线程本地 HTTP 连接以停止
+                # 令牌生成，而不会污染用于
+                # 种子未来重试的共享客户端。
                 try:
                     if self.api_mode == "anthropic_messages":
                         from agent.anthropic_adapter import build_anthropic_client
@@ -5520,11 +5523,11 @@ class AIAgent:
     # ── Unified streaming API call ─────────────────────────────────────────
 
     def _reset_stream_delivery_tracking(self) -> None:
-        """Reset tracking for text delivered during the current model response."""
+        """重置当前模型响应期间传递的文本的跟踪。"""
         self._current_streamed_assistant_text = ""
 
     def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks."""
+        """累积通过流回调发出的可见助手文本。"""
         if isinstance(text, str) and text:
             self._current_streamed_assistant_text = (
                 getattr(self, "_current_streamed_assistant_text", "") + text
@@ -5548,7 +5551,7 @@ class AIAgent:
         return bool(streamed) and streamed == visible_content
 
     def _emit_interim_assistant_message(self, assistant_msg: Dict[str, Any]) -> None:
-        """Surface a real mid-turn assistant commentary message to the UI layer."""
+        """将真实的回合中助手评论消息呈现到 UI 层。"""
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
@@ -5563,11 +5566,11 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
-        # If a tool iteration set the break flag, prepend a single paragraph
-        # break before the first real text delta.  This prevents the original
-        # problem (text concatenation across tool boundaries) without stacking
-        # blank lines when multiple tool iterations run back-to-back.
+        """触发所有注册的流增量回调（显示 + TTS）。"""
+        # 如果工具迭代设置了中断标志，在第一个真实文本增量前
+        # 前置单个段落中断。这防止了原始问题
+        #（跨工具边界的文本连接），而不会在
+        # 多个工具迭代背靠背运行时堆叠空行。
         if getattr(self, "_stream_needs_break", False) and text and text.strip():
             self._stream_needs_break = False
             text = "\n\n" + text
@@ -5583,7 +5586,7 @@ class AIAgent:
             self._record_streamed_assistant_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
-        """Fire reasoning callback if registered."""
+        """如果注册了推理回调则触发。"""
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -5592,12 +5595,14 @@ class AIAgent:
                 pass
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
-        """Notify display layer that the model is generating tool call arguments.
+        """通知显示层模型正在生成工具调用参数。
 
-        Fires once per tool name when the streaming response begins producing
-        tool_call / tool_use tokens.  Gives the TUI a chance to show a spinner
-        or status line so the user isn't staring at a frozen screen while a
-        large tool payload (e.g. a 45 KB write_file) is being generated.
+        当流式响应开始产生
+        tool_call / tool_use 令牌时，每个工具名称触发一次。
+        给 TUI 一个机会显示旋转器
+        或状态行，以便用户在生成
+        大型工具有效载荷（例如 45 KB 的 write_file）时
+        不会盯着冻结的屏幕。
         """
         cb = self.tool_gen_callback
         if cb is not None:
@@ -5607,7 +5612,7 @@ class AIAgent:
                 pass
 
     def _has_stream_consumers(self) -> bool:
-        """Return True if any streaming consumer is registered."""
+        """如果注册了任何流式消费者则返回 True。"""
         return (
             self.stream_delta_callback is not None
             or getattr(self, "_stream_callback", None) is not None
@@ -5616,34 +5621,34 @@ class AIAgent:
     def _interruptible_streaming_api_call(
         self, api_kwargs: dict, *, on_first_delta: callable = None
     ):
-        """Streaming variant of _interruptible_api_call for real-time token delivery.
+        """_interruptible_api_call 的流式变体，用于实时令牌传递。
 
-        Handles all three api_modes:
-        - chat_completions: stream=True on OpenAI-compatible endpoints
-        - anthropic_messages: client.messages.stream() via Anthropic SDK
-        - codex_responses: delegates to _run_codex_stream (already streaming)
+        处理所有三种 api_modes：
+        - chat_completions：在 OpenAI 兼容端点上使用 stream=True
+        - anthropic_messages：通过 Anthropic SDK 使用 client.messages.stream()
+        - codex_responses：委托给 _run_codex_stream（已经在流式传输）
 
-        Fires stream_delta_callback and _stream_callback for each text token.
-        Tool-call turns suppress the callback — only text-only final responses
-        stream to the consumer.  Returns a SimpleNamespace that mimics the
-        non-streaming response shape so the rest of the agent loop is unchanged.
+        为每个文本令牌触发 stream_delta_callback 和 _stream_callback。
+        工具调用回合抑制回调 — 仅纯文本最终响应
+        流式传输给消费者。返回一个模仿
+        非流式响应形状的 SimpleNamespace，以便代理循环的其余部分保持不变。
 
-        Falls back to _interruptible_api_call on provider errors indicating
-        streaming is not supported.
+        在指示不支持流式传输的提供商错误上
+        回退到 _interruptible_api_call。
         """
         if self.api_mode == "codex_responses":
-            # Codex streams internally via _run_codex_stream. The main dispatch
-            # in _interruptible_api_call already calls it; we just need to
-            # ensure on_first_delta reaches it. Store it on the instance
-            # temporarily so _run_codex_stream can pick it up.
+            # Codex 通过 _run_codex_stream 内部流式传输。
+            # _interruptible_api_call 中的主要调度已经调用它；
+            # 我们只需要确保 on_first_delta 到达它。
+            # 将其临时存储在实例上，以便 _run_codex_stream 可以拾取它。
             self._codex_on_first_delta = on_first_delta
             try:
                 return self._interruptible_api_call(api_kwargs)
             finally:
                 self._codex_on_first_delta = None
 
-        # Bedrock Converse uses boto3's converse_stream() with real-time delta
-        # callbacks — same UX as Anthropic and chat_completions streaming.
+        # Bedrock Converse 使用 boto3 的 converse_stream() 和实时增量
+        # 回调 — 与 Anthropic 和 chat_completions 流式传输相同的 UX。
         if self.api_mode == "bedrock_converse":
             result = {"response": None, "error": None}
             first_delta_fired = {"done": False}
@@ -5705,9 +5710,9 @@ class AIAgent:
         request_client_holder = {"client": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
-        # Wall-clock timestamp of the last real streaming chunk.  The outer
-        # poll loop uses this to detect stale connections that keep receiving
-        # SSE keep-alive pings but no actual data.
+        # 上次真实流式块的实际时间戳。外部
+        # 轮询循环使用它来检测陈旧连接，这些连接不断接收
+        # SSE keep-alive ping 但没有实际数据。
         last_chunk_time = {"t": time.time()}
 
         def _fire_first_delta():
@@ -5719,14 +5724,14 @@ class AIAgent:
                     pass
 
         def _call_chat_completions():
-            """Stream a chat completions response."""
+            """流式传输聊天完成响应。"""
             import httpx as _httpx
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
             _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-            # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-            # prefill on large contexts before producing the first token.
-            # Auto-increase the httpx read timeout unless the user explicitly
-            # overrode HERMES_STREAM_READ_TIMEOUT.
+            # 本地提供商（Ollama、llama.cpp、vLLM）可能需要几分钟
+            # 在大型上下文上进行预填充，然后产生第一个令牌。
+            # 自动增加 httpx 读取超时，除非用户明确
+            # 覆盖了 HERMES_STREAM_READ_TIMEOUT。
             if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
                 _stream_read_timeout = _base_timeout
                 logger.debug(
@@ -5747,24 +5752,24 @@ class AIAgent:
             request_client_holder["client"] = self._create_request_openai_client(
                 reason="chat_completion_stream_request"
             )
-            # Reset stale-stream timer so the detector measures from this
-            # attempt's start, not a previous attempt's last chunk.
+            # 重置陈旧流计时器，以便检测器从
+            # 此尝试的开始测量，而不是前一次尝试的最后一个块。
             last_chunk_time["t"] = time.time()
             self._touch_activity("waiting for provider response (streaming)")
             stream = request_client_holder["client"].chat.completions.create(**stream_kwargs)
 
-            # Capture rate limit headers from the initial HTTP response.
-            # The OpenAI SDK Stream object exposes the underlying httpx
-            # response via .response before any chunks are consumed.
+            # 从初始 HTTP 响应中捕获速率限制头部。
+            # OpenAI SDK Stream 对象在消耗任何块之前
+            # 通过 .response 暴露底层的 httpx 响应。
             self._capture_rate_limits(getattr(stream, "response", None))
 
             content_parts: list = []
             tool_calls_acc: dict = {}
             tool_gen_notified: set = set()
-            # Ollama-compatible endpoints reuse index 0 for every tool call
-            # in a parallel batch, distinguishing them only by id.  Track
-            # the last seen id per raw index so we can detect a new tool
-            # call starting at the same index and redirect it to a fresh slot.
+            # Ollama 兼容端点为并行批次中的每个工具调用
+            # 重用索引 0，仅通过 id 区分它们。
+            # 跟踪每个原始索引最后看到的 id，以便我们可以检测
+            # 在相同索引开始的新工具调用并将其重定向到新槽。
             _last_id_at_idx: dict = {}      # raw_index -> last seen non-empty id
             _active_slot_by_idx: dict = {}  # raw_index -> current slot in tool_calls_acc
             finish_reason = None
@@ -5857,14 +5862,13 @@ class AIAgent:
                             entry["id"] = tc_delta.id
                         if tc_delta.function:
                             if tc_delta.function.name:
-                                # Use assignment, not +=.  Function names are
-                                # atomic identifiers delivered complete in the
-                                # first chunk (OpenAI spec).  Some providers
-                                # (MiniMax M2.7 via NVIDIA NIM) resend the full
-                                # name in every chunk; concatenation would
-                                # produce "read_fileread_file".  Assignment
-                                # (matching the OpenAI Node SDK / LiteLLM /
-                                # Vercel AI patterns) is immune to this.
+                                # 使用赋值，而不是 +=。函数名是
+                                # 在第一个块中完整传递的原子标识符（OpenAI 规范）。
+                                # 一些提供商（通过 NVIDIA NIM 的 MiniMax M2.7）在每个块中
+                                # 重新发送完整名称；连接会产生
+                                # "read_fileread_file"。赋值
+                                # （匹配 OpenAI Node SDK / LiteLLM /
+                                # Vercel AI 模式）对此免疫。
                                 entry["function"]["name"] = tc_delta.function.name
                             if tc_delta.function.arguments:
                                 entry["function"]["arguments"] += tc_delta.function.arguments
@@ -5875,19 +5879,18 @@ class AIAgent:
                             if hasattr(extra, "model_dump"):
                                 extra = extra.model_dump()
                             entry["extra_content"] = extra
-                        # Fire once per tool when the full name is available
+                        # 当完整名称可用时，每个工具触发一次
                         name = entry["function"]["name"]
                         if name and idx not in tool_gen_notified:
                             tool_gen_notified.add(idx)
                             _fire_first_delta()
                             self._fire_tool_gen_started(name)
-                            # Record the partial tool-call name so the outer
-                            # stub-builder can surface a user-visible warning
-                            # if streaming dies before this tool's arguments
-                            # are fully delivered.  Without this, a stall
-                            # during tool-call JSON generation lets the stub
-                            # at line ~6107 return `tool_calls=None`, silently
-                            # discarding the attempted action.
+                            # 记录部分工具调用名称，以便外部
+                            # 存根构建器可以在流式传输在此工具的参数
+                            # 完全传递之前死亡时显示用户可见的警告。
+                            # 没有这个，工具调用 JSON 生成期间的停滞
+                            # 会让第 ~6107 行的存根返回 `tool_calls=None`，
+                            # 静默地丢弃尝试的操作。
                             result["partial_tool_names"].append(name)
 
                 if chunk.choices[0].finish_reason:
@@ -5897,7 +5900,7 @@ class AIAgent:
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
 
-            # Build mock response matching non-streaming shape
+            # 构建匹配非流式形状的模拟响应
             full_content = "".join(content_parts) or None
             mock_tool_calls = None
             has_truncated_tool_args = False
@@ -5945,26 +5948,27 @@ class AIAgent:
             )
 
         def _call_anthropic():
-            """Stream an Anthropic Messages API response.
+            """流式传输 Anthropic Messages API 响应。
 
-            Fires delta callbacks for real-time token delivery, but returns
-            the native Anthropic Message object from get_final_message() so
-            the rest of the agent loop (validation, tool extraction, etc.)
-            works unchanged.
+            为实时令牌传递触发增量回调，但
+            从 get_final_message() 返回
+            原生 Anthropic Message 对象，以便
+            代理循环的其余部分（验证、工具提取等）
+            正常工作。
             """
             has_tool_use = False
 
-            # Reset stale-stream timer for this attempt
+            # 为此尝试重置陈旧流计时器
             last_chunk_time["t"] = time.time()
-            # Use the Anthropic SDK's streaming context manager
+            # 使用 Anthropic SDK 的流式上下文管理器
             with self._anthropic_client.messages.stream(**api_kwargs) as stream:
                 for event in stream:
-                    # Update stale-stream timer on every event so the
-                    # outer poll loop knows data is flowing.  Without
-                    # this, the detector kills healthy long-running
-                    # Opus streams after 180 s even when events are
-                    # actively arriving (the chat_completions path
-                    # already does this at the top of its chunk loop).
+                    # 在每个事件上更新陈旧流计时器，以便
+                    # 外部轮询循环知道数据正在流动。
+                    # 没有这个，检测器会在 180 秒后杀死健康的
+                    # 长时间运行的 Opus 流，即使事件正在
+                    # 积极到达（chat_completions 路径
+                    # 在其块循环顶部已经这样做）。
                     last_chunk_time["t"] = time.time()
                     self._touch_activity("receiving stream response")
 
@@ -5998,7 +6002,7 @@ class AIAgent:
                                     _fire_first_delta()
                                     self._fire_reasoning_delta(thinking_text)
 
-                # Return the native Anthropic Message for downstream processing
+                # 返回原生 Anthropic Message 以进行下游处理
                 return stream.get_final_message()
 
         def _call():
@@ -6017,9 +6021,9 @@ class AIAgent:
                         return  # success
                     except Exception as e:
                         if deltas_were_sent["yes"]:
-                            # Streaming failed AFTER some tokens were already
-                            # delivered.  Don't retry or fall back — partial
-                            # content already reached the user.
+                            # 流式传输在一些令牌已经
+                            # 传递后失败。不要重试或回退 — 部分
+                            # 内容已经到达用户。
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
@@ -6033,14 +6037,14 @@ class AIAgent:
                             e, (_httpx.ConnectError, _httpx.RemoteProtocolError, ConnectionError)
                         )
 
-                        # SSE error events from proxies (e.g. OpenRouter sends
-                        # {"error":{"message":"Network connection lost."}}) are
-                        # raised as APIError by the OpenAI SDK.  These are
-                        # semantically identical to httpx connection drops —
-                        # the upstream stream died — and should be retried with
-                        # a fresh connection.  Distinguish from HTTP errors:
-                        # APIError from SSE has no status_code, while
-                        # APIStatusError (4xx/5xx) always has one.
+                        # 来自代理的 SSE 错误事件（例如 OpenRouter 发送
+                        # {"error":{"message":"Network connection lost."}}）
+                        # 被 OpenAI SDK 作为 APIError 引发。
+                        # 这些在语义上与 httpx 连接断开相同 —
+                        # 上游流死亡 — 应该使用
+                        # 新连接重试。与 HTTP 错误区分：
+                        # 来自 SSE 的 APIError 没有 status_code，而
+                        # APIStatusError (4xx/5xx) 总是有。
                         _is_sse_conn_err = False
                         if not _is_timeout and not _is_conn_err:
                             from openai import APIError as _APIError
@@ -6064,8 +6068,8 @@ class AIAgent:
                                 )
 
                         if _is_timeout or _is_conn_err or _is_sse_conn_err:
-                            # Transient network / timeout error. Retry the
-                            # streaming request with a fresh connection first.
+                            # 瞬态网络/超时错误。首先使用
+                            # 新连接重试流式请求。
                             if _stream_attempt < _max_stream_retries:
                                 logger.info(
                                     "Streaming attempt %s/%s failed (%s: %s), "
@@ -6084,15 +6088,15 @@ class AIAgent:
                                     f"stream retry {_stream_attempt + 2}/{_max_stream_retries + 1} "
                                     f"after {type(e).__name__}"
                                 )
-                                # Close the stale request client before retry
+                                # 重试前关闭陈旧的请求客户端
                                 stale = request_client_holder.get("client")
                                 if stale is not None:
                                     self._close_request_openai_client(
                                         stale, reason="stream_retry_cleanup"
                                     )
                                     request_client_holder["client"] = None
-                                # Also rebuild the primary client to purge
-                                # any dead connections from the pool.
+                                # 同时重建主客户端以清除
+                                # 池中的任何死连接。
                                 try:
                                     self._replace_primary_openai_client(
                                         reason="stream_retry_pool_cleanup"
@@ -6131,11 +6135,11 @@ class AIAgent:
                                 e,
                             )
 
-                        # Propagate the error to the main retry loop instead of
-                        # falling back to non-streaming inline.  The main loop has
-                        # richer recovery: credential rotation, provider fallback,
-                        # backoff, and — for "stream not supported" — will switch
-                        # to non-streaming on the next attempt via _disable_streaming.
+                        # 将错误传播到主重试循环，而不是
+                        # 内联回退到非流式。主循环有
+                        # 更丰富的恢复：凭证轮换、提供商回退、
+                        # 退避，并且 — 对于"不支持流式" — 将通过
+                        # _disable_streaming 在下一次尝试时切换到非流式。
                         result["error"] = e
                         return
             finally:
@@ -6144,18 +6148,19 @@ class AIAgent:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
 
         _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
-        # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
-        # for prefill on large contexts.  Disable the stale detector unless
-        # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
+        # 本地提供商（Ollama、oMLX、llama-cpp）可能需要 300+ 秒
+        # 在大型上下文上进行预填充。禁用陈旧检测器，除非
+        # 用户明确设置了 HERMES_STREAM_STALE_TIMEOUT。
         if _stream_stale_timeout_base == 180.0 and self.base_url and is_local_endpoint(self.base_url):
             _stream_stale_timeout = float("inf")
             logger.debug("Local provider detected (%s) — stale stream timeout disabled", self.base_url)
         else:
-            # Scale the stale timeout for large contexts: slow models (like Opus)
-            # can legitimately think for minutes before producing the first token
-            # when the context is large.  Without this, the stale detector kills
-            # healthy connections during the model's thinking phase, producing
-            # spurious RemoteProtocolError ("peer closed connection").
+            # 为大型上下文扩展陈旧超时：慢速模型（如 Opus）
+            # 在上下文大时可以在产生第一个令牌之前
+            # 合法地思考几分钟。
+            # 没有这个，陈旧检测器在模型的思考阶段
+            # 杀死健康连接，产生
+            # 虚假的 RemoteProtocolError（"对等方关闭连接"）。
             _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
             if _est_tokens > 100_000:
                 _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
@@ -6171,14 +6176,15 @@ class AIAgent:
         while t.is_alive():
             t.join(timeout=0.3)
 
-            # Periodic heartbeat: touch the agent's activity tracker so the
-            # gateway's inactivity monitor knows we're alive while waiting
-            # for stream chunks.  Without this, long thinking pauses (e.g.
-            # reasoning models) or slow prefill on local providers (Ollama)
-            # trigger false inactivity timeouts.  The _call thread touches
-            # activity on each chunk, but the gap between API call start
-            # and first chunk can exceed the gateway timeout — especially
-            # when the stale-stream timeout is disabled (local providers).
+            # 定期心跳：触摸代理的活动跟踪器，以便
+            # 网关的非活动监视器知道我们在等待
+            # 流块时仍然存活。
+            # 没有这个，长时间的思考暂停（例如。
+            # 推理模型）或本地提供商（Ollama）上的缓慢预填充
+            # 会触发错误的非活动超时。_call 线程在每个块上
+            # 触摸活动，但 API 调用开始和
+            # 第一个块之间的间隔可能超过网关超时 — 特别是
+            # 当陈旧流超时被禁用时（本地提供商）。
             _hb_now = time.time()
             if _hb_now - _last_heartbeat >= _HEARTBEAT_INTERVAL:
                 _last_heartbeat = _hb_now
@@ -6187,9 +6193,9 @@ class AIAgent:
                     f"waiting for stream response ({_waiting_secs}s, no chunks yet)"
                 )
 
-            # Detect stale streams: connections kept alive by SSE pings
-            # but delivering no real chunks.  Kill the client so the
-            # inner retry loop can start a fresh connection.
+            # 检测陈旧流：由 SSE ping 保持活跃
+            # 但不传递真实块的连接。终止客户端以便
+            # 内部重试循环可以开始新连接。
             _stale_elapsed = time.time() - last_chunk_time["t"]
             if _stale_elapsed > _stream_stale_timeout:
                 _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
@@ -6211,14 +6217,14 @@ class AIAgent:
                         self._close_request_openai_client(rc, reason="stale_stream_kill")
                 except Exception:
                     pass
-                # Rebuild the primary client too — its connection pool
-                # may hold dead sockets from the same provider outage.
+                # 同时重建主客户端 — 其连接池
+                # 可能持有来自同一提供商中断的死套接字。
                 try:
                     self._replace_primary_openai_client(reason="stale_stream_pool_cleanup")
                 except Exception:
                     pass
-                # Reset the timer so we don't kill repeatedly while
-                # the inner thread processes the closure.
+                # 重置计时器，以便在
+                # 内部线程处理关闭时我们不会重复终止。
                 last_chunk_time["t"] = time.time()
                 self._touch_activity(
                     f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
@@ -6243,26 +6249,26 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during streaming API call")
         if result["error"] is not None:
             if deltas_were_sent["yes"]:
-                # Streaming failed AFTER some tokens were already delivered to
-                # the platform.  Re-raising would let the outer retry loop make
-                # a new API call, creating a duplicate message.  Return a
-                # partial "stop" response instead so the outer loop treats this
-                # turn as complete (no retry, no fallback).
-                # Recover whatever content was already streamed to the user.
-                # _current_streamed_assistant_text accumulates text fired
-                # through _fire_stream_delta, so it has exactly what the
-                # user saw before the connection died.
+                # 流式传输在一些令牌已经传递到
+                # 平台后失败。重新引发会让外部重试循环
+                # 进行新的 API 调用，创建重复消息。
+                # 返回部分 "stop" 响应，以便外部循环将此
+                # 回合视为完成（不重试，不回退）。
+                # 恢复已经流式传输给用户的任何内容。
+                # _current_streamed_assistant_text 累积通过
+                # _fire_stream_delta 触发的文本，因此它具有
+                # 连接死亡前用户看到的确切内容。
                 _partial_text = (
                     getattr(self, "_current_streamed_assistant_text", "") or ""
                 ).strip() or None
 
-                # If the stream died while the model was emitting a tool call,
-                # the stub below will silently set `tool_calls=None` and the
-                # agent loop will treat the turn as complete — the attempted
-                # action is lost with no user-facing signal.  Append a
-                # human-visible warning to the stub content so (a) the user
-                # knows something failed, and (b) the next turn's model sees
-                # in conversation history what was attempted and can retry.
+                # 如果流在模型发出工具调用时死亡，
+                # 下面的存根将静默设置 `tool_calls=None`，
+                # 并且代理循环将把回合视为完成 — 尝试的
+                # 操作丢失，没有面向用户的信号。
+                # 向存根内容附加人类可见的警告，以便 (a) 用户
+                # 知道某些事情失败了，并且 (b) 下一回合的模型在
+                # 对话历史中看到尝试的内容并可以重试。
                 _partial_names = list(result.get("partial_tool_names") or [])
                 if _partial_names:
                     _name_str = ", ".join(_partial_names[:3])
@@ -6274,8 +6280,8 @@ class AIAgent:
                         f"Ask me to retry if you want to continue."
                     )
                     _partial_text = (_partial_text or "") + _warn
-                    # Also fire as a streaming delta so the user sees it now
-                    # instead of only in the persisted transcript.
+                    # 同时作为流式增量触发，以便用户现在看到它
+                    # 而不仅仅是在持久化的记录中。
                     try:
                         self._fire_stream_delta(_warn)
                     except Exception:
@@ -6311,16 +6317,16 @@ class AIAgent:
     # ── Provider fallback ──────────────────────────────────────────────────
 
     def _try_activate_fallback(self) -> bool:
-        """Switch to the next fallback model/provider in the chain.
+        """切换到链中的下一个回退模型/提供商。
 
-        Called when the current model is failing after retries.  Swaps the
-        OpenAI client, model slug, and provider in-place so the retry loop
-        can continue with the new backend.  Advances through the chain on
-        each call; returns False when exhausted.
+        在当前模型重试失败后调用。就地交换
+        OpenAI 客户端、模型 slug 和提供商，以便重试循环
+        可以使用新后端继续。在每次调用时
+        推进链；耗尽时返回 False。
 
-        Uses the centralized provider router (resolve_provider_client) for
-        auth resolution and client construction — no duplicated provider→key
-        mappings.
+        使用集中式提供商路由器（resolve_provider_client）进行
+        身份验证解析和客户端构建 — 没有重复的提供商→密钥
+        映射。
         """
         if self._fallback_index >= len(self._fallback_chain):
             return False
@@ -6332,18 +6338,18 @@ class AIAgent:
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
 
-        # Use centralized router for client construction.
-        # raw_codex=True because the main agent needs direct responses.stream()
-        # access for Codex providers.
+        # 使用集中式路由器进行客户端构建。
+        # raw_codex=True 因为主代理需要直接的 responses.stream()
+        # 访问 Codex 提供商。
         try:
             from agent.auxiliary_client import resolve_provider_client
-            # Pass base_url and api_key from fallback config so custom
-            # endpoints (e.g. Ollama Cloud) resolve correctly instead of
-            # falling through to OpenRouter defaults.
+            # 从回退配置传递 base_url 和 api_key，以便自定义
+            # 端点（例如 Ollama Cloud）正确解析，而不是
+            # 回退到 OpenRouter 默认值。
             fb_base_url_hint = (fb.get("base_url") or "").strip() or None
             fb_api_key_hint = (fb.get("api_key") or "").strip() or None
-            # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
-            # when no explicit key is in the fallback config.
+            # 对于 Ollama Cloud 端点，当回退配置中没有
+            # 显式密钥时，从环境变量中提取 OLLAMA_API_KEY。
             if fb_base_url_hint and "ollama.com" in fb_base_url_hint.lower() and not fb_api_key_hint:
                 fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
             fb_client, _resolved_fb_model = resolve_provider_client(
@@ -6375,9 +6381,8 @@ class AIAgent:
                 fb_model,
                 provider=fb_provider,
             ):
-                # GPT-5.x models usually need Responses API, but keep
-                # provider-specific exceptions like Copilot gpt-5-mini on
-                # chat completions.
+                # GPT-5.x 模型通常需要 Responses API，但保留
+                # 提供商特定的例外，如聊天完成上的 Copilot gpt-5-mini。
                 fb_api_mode = "codex_responses"
             elif fb_provider == "bedrock" or "bedrock-runtime" in fb_base_url.lower():
                 fb_api_mode = "bedrock_converse"
@@ -6390,7 +6395,7 @@ class AIAgent:
             self._fallback_activated = True
 
             if fb_api_mode == "anthropic_messages":
-                # Build native Anthropic client instead of using OpenAI client
+                # 构建原生 Anthropic 客户端而不是使用 OpenAI 客户端
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
                 effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self.api_key = effective_key
@@ -6401,17 +6406,9 @@ class AIAgent:
                 self.client = None
                 self._client_kwargs = {}
             else:
-                # Swap OpenAI client and config in-place
+                # 就地交换 OpenAI 客户端和配置
                 self.api_key = fb_client.api_key
                 self.client = fb_client
-                # Preserve provider-specific headers that
-                # resolve_provider_client() may have baked into
-                # fb_client via the default_headers kwarg.  The OpenAI
-                # SDK stores these in _custom_headers.  Without this,
-                # subsequent request-client rebuilds (via
-                # _create_request_openai_client) drop the headers,
-                # causing 403s from providers like Kimi Coding that
-                # require a User-Agent sentinel.
                 fb_headers = getattr(fb_client, "_custom_headers", None)
                 if not fb_headers:
                     fb_headers = getattr(fb_client, "default_headers", None)
@@ -6421,17 +6418,17 @@ class AIAgent:
                     **({"default_headers": dict(fb_headers)} if fb_headers else {}),
                 }
 
-            # Re-evaluate prompt caching for the new provider/model
+            # 为新的提供商/模型重新评估提示缓存
             is_native_anthropic = fb_api_mode == "anthropic_messages" and fb_provider == "anthropic"
             self._use_prompt_caching = (
                 ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
                 or is_native_anthropic
             )
 
-            # Update context compressor limits for the fallback model.
-            # Without this, compression decisions use the primary model's
-            # context window (e.g. 200K) instead of the fallback's (e.g. 32K),
-            # causing oversized sessions to overflow the fallback.
+            # 更新回退模型的上下文压缩器限制。
+            # 没有这个，压缩决策使用主模型的
+            # 上下文窗口（例如 200K）而不是回退的（例如 32K），
+            # 导致过大的会话溢出回退。
             if hasattr(self, 'context_compressor') and self.context_compressor:
                 from agent.model_metadata import get_model_context_length
                 fb_context_length = get_model_context_length(
@@ -6462,31 +6459,32 @@ class AIAgent:
     # ── Per-turn primary restoration ─────────────────────────────────────
 
     def _restore_primary_runtime(self) -> bool:
-        """Restore the primary runtime at the start of a new turn.
+        """在新回合开始时恢复主运行时。
 
-        In long-lived CLI sessions a single AIAgent instance spans multiple
-        turns.  Without restoration, one transient failure pins the session
-        to the fallback provider for every subsequent turn.  Calling this at
-        the top of ``run_conversation()`` makes fallback turn-scoped.
+        在长时间运行的 CLI 会话中，单个 AIAgent 实例跨越多个
+        回合。没有恢复，一个瞬态故障会将会话
+        固定到每个后续回合的回退提供商。
+        在 ``run_conversation()`` 顶部调用此函数
+        使回退成为回合作用域。
 
-        The gateway caches agents across messages (``_agent_cache`` in
-        ``gateway/run.py``), so this restoration IS needed there too.
+        网关在消息之间缓存代理（``gateway/run.py`` 中的
+        ``_agent_cache``），因此那里也需要此恢复。
         """
         if not self._fallback_activated:
             return False
 
         rt = self._primary_runtime
         try:
-            # ── Core runtime state ──
+            # ── 核心运行时状态 ──
             self.model = rt["model"]
             self.provider = rt["provider"]
-            self.base_url = rt["base_url"]           # setter updates _base_url_lower
+            self.base_url = rt["base_url"]           # setter 更新 _base_url_lower
             self.api_mode = rt["api_mode"]
             self.api_key = rt["api_key"]
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
 
-            # ── Rebuild client for the primary provider ──
+            # ── 为主提供商重建客户端 ──
             if self.api_mode == "anthropic_messages":
                 from agent.anthropic_adapter import build_anthropic_client
                 self._anthropic_api_key = rt["anthropic_api_key"]
@@ -6503,7 +6501,7 @@ class AIAgent:
                     shared=True,
                 )
 
-            # ── Restore context engine state ──
+            # ── 恢复上下文引擎状态 ──
             cc = self.context_compressor
             cc.update_model(
                 model=rt["compressor_model"],
@@ -6513,7 +6511,7 @@ class AIAgent:
                 provider=rt["compressor_provider"],
             )
 
-            # ── Reset fallback chain for the new turn ──
+            # ── 为新回合重置回退链 ──
             self._fallback_activated = False
             self._fallback_index = 0
 
@@ -6526,8 +6524,8 @@ class AIAgent:
             logging.warning("Failed to restore primary runtime: %s", e)
             return False
 
-    # Which error types indicate a transient transport failure worth
-    # one more attempt with a rebuilt client / connection pool.
+    # 哪些错误类型表示瞬态传输故障，值得
+    # 使用重建的客户端/连接池再尝试一次。
     _TRANSIENT_TRANSPORT_ERRORS = frozenset({
         "ReadTimeout", "ConnectTimeout", "PoolTimeout",
         "ConnectError", "RemoteProtocolError",
@@ -6537,27 +6535,27 @@ class AIAgent:
     def _try_recover_primary_transport(
         self, api_error: Exception, *, retry_count: int, max_retries: int,
     ) -> bool:
-        """Attempt one extra primary-provider recovery cycle for transient transport failures.
+        """为瞬态传输故障尝试一个额外的主提供商恢复周期。
 
-        After ``max_retries`` exhaust, rebuild the primary client (clearing
-        stale connection pools) and give it one more attempt before falling
-        back.  This is most useful for direct endpoints (custom, Z.AI,
-        Anthropic, OpenAI, local models) where a TCP-level hiccup does not
-        mean the provider is down.
+        在 ``max_retries`` 耗尽后，重建主客户端（清除
+        陈旧连接池）并在回退前再给它
+        一次机会。这对于直接端点（自定义、Z.AI、
+        Anthropic、OpenAI、本地模型）最有用，其中 TCP 级别的
+        小故障并不意味着提供商已关闭。
 
-        Skipped for proxy/aggregator providers (OpenRouter, Nous) which
-        already manage connection pools and retries server-side — if our
-        retries through them are exhausted, one more rebuilt client won't help.
+        跳过代理/聚合提供商（OpenRouter、Nous），它们
+        已经在服务器端管理连接池和重试 — 如果我们
+        通过它们的重试已耗尽，再重建一个客户端也无济于事。
         """
         if self._fallback_activated:
             return False
 
-        # Only for transient transport errors
+        # 仅用于瞬态传输错误
         error_type = type(api_error).__name__
         if error_type not in self._TRANSIENT_TRANSPORT_ERRORS:
             return False
 
-        # Skip for aggregator providers — they manage their own retry infra
+        # 跳过聚合提供商 — 它们管理自己的重试基础设施
         if self._is_openrouter_url():
             return False
         provider_lower = (self.provider or "").strip().lower()
@@ -6565,7 +6563,7 @@ class AIAgent:
             return False
 
         try:
-            # Close existing client to release stale connections
+            # 关闭现有客户端以释放陈旧连接
             if getattr(self, "client", None) is not None:
                 try:
                     self._close_openai_client(
@@ -6574,7 +6572,7 @@ class AIAgent:
                 except Exception:
                     pass
 
-            # Rebuild from primary snapshot
+            # 从主快照重建
             rt = self._primary_runtime
             self._client_kwargs = dict(rt["client_kwargs"])
             self.model = rt["model"]
@@ -6804,7 +6802,7 @@ class AIAgent:
         return prepared
 
     def _qwen_prepare_chat_messages_inplace(self, messages: list) -> None:
-        """In-place variant — mutates an already-copied message list."""
+        """就地变体 — 改变已复制的消息列表。"""
         if not messages:
             return
 
@@ -6832,18 +6830,18 @@ class AIAgent:
                 break
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
-        """Build the keyword arguments dict for the active API mode."""
+        """为活动 API 模式构建关键字参数字典。"""
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_kwargs
             anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
-            # Pass context_length (total input+output window) so the adapter can
-            # clamp max_tokens (output cap) when the user configured a smaller
-            # context window than the model's native output limit.
+            # 传递 context_length（总输入+输出窗口），以便适配器可以在
+            # 用户配置了比模型原生输出限制更小的上下文窗口时
+            # 限制 max_tokens（输出上限）。
             ctx_len = getattr(self, "context_compressor", None)
             ctx_len = ctx_len.context_length if ctx_len else None
-            # _ephemeral_max_output_tokens is set for one call when the API
-            # returns "max_tokens too large given prompt" — it caps output to
-            # the available window space without touching context_length.
+            # 当 API 返回"给定提示的 max_tokens 过大"时，
+            # _ephemeral_max_output_tokens 为一次调用设置 — 它将输出限制到
+            # 可用窗口空间，而不触及 context_length。
             ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
             if ephemeral_out is not None:
                 self._ephemeral_max_output_tokens = None  # consume immediately
@@ -6860,8 +6858,8 @@ class AIAgent:
                 fast_mode=(self.request_overrides or {}).get("speed") == "fast",
             )
 
-        # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
-        # The adapter handles message/tool conversion and boto3 calls directly.
+        # AWS Bedrock 原生 Converse API — 完全绕过 OpenAI 客户端。
+        # 适配器直接处理消息/工具转换和 boto3 调用。
         if self.api_mode == "bedrock_converse":
             from agent.bedrock_adapter import build_converse_kwargs
             region = getattr(self, "_bedrock_region", None) or "us-east-1"
@@ -6897,7 +6895,7 @@ class AIAgent:
                 or "chatgpt.com/backend-api/codex" in self.base_url.lower()
             )
 
-            # Resolve reasoning effort: config > default (medium)
+            # 解析推理努力程度：配置 > 默认（中等）
             reasoning_effort = "medium"
             reasoning_enabled = True
             if self.reasoning_config and isinstance(self.reasoning_config, dict):
@@ -6906,9 +6904,9 @@ class AIAgent:
                 elif self.reasoning_config.get("effort"):
                     reasoning_effort = self.reasoning_config["effort"]
 
-            # Clamp effort levels not supported by the Responses API model.
-            # GPT-5.4 supports none/low/medium/high/xhigh but not "minimal".
-            # "minimal" is valid on OpenRouter and GPT-5 but fails on 5.2/5.4.
+            # 限制 Responses API 模型不支持的努力程度级别。
+            # GPT-5.4 支持 none/low/medium/high/xhigh 但不支持 "minimal"。
+            # "minimal" 在 OpenRouter 和 GPT-5 上有效，但在 5.2/5.4 上失败。
             _effort_clamp = {"minimal": "low"}
             reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
@@ -6928,13 +6926,13 @@ class AIAgent:
             is_xai_responses = self.provider == "xai" or "api.x.ai" in (self.base_url or "").lower()
 
             if reasoning_enabled and is_xai_responses:
-                # xAI reasons automatically — no effort param, just include encrypted content
+                # xAI 自动推理 — 没有努力参数，只需包含加密内容
                 kwargs["include"] = ["reasoning.encrypted_content"]
             elif reasoning_enabled:
                 if is_github_responses:
-                    # Copilot's Responses route advertises reasoning-effort support,
-                    # but not OpenAI-specific prompt cache or encrypted reasoning
-                    # fields. Keep the payload to the documented subset.
+                    # Copilot 的 Responses 路由宣传支持 reasoning-effort，
+                    # 但不支持 OpenAI 特定的提示缓存或加密推理
+                    # 字段。将有效负载保持在文档记录的子集内。
                     github_reasoning = self._github_models_reasoning_extra_body()
                     if github_reasoning is not None:
                         kwargs["reasoning"] = github_reasoning
@@ -6981,7 +6979,7 @@ class AIAgent:
                 if not isinstance(msg, dict):
                     continue
 
-                # Codex-only replay state must not leak into strict chat-completions APIs.
+                # 仅 Codex 的重放状态不能泄漏到严格的聊天完成 API 中。
                 msg.pop("codex_reasoning_items", None)
 
                 tool_calls = msg.get("tool_calls")
@@ -6991,27 +6989,27 @@ class AIAgent:
                             tool_call.pop("call_id", None)
                             tool_call.pop("response_item_id", None)
 
-        # Qwen portal: normalize content to list-of-dicts, inject cache_control.
-        # Must run AFTER codex sanitization so we transform the final messages.
-        # If sanitization already deepcopied, reuse that copy (in-place).
+        # Qwen portal：将内容标准化为字典列表，注入 cache_control。
+        # 必须在 codex 清理之后运行，以便我们转换最终消息。
+        # 如果清理已经深拷贝，则重用该副本（就地）。
         if self._is_qwen_portal():
             if sanitized_messages is api_messages:
-                # No sanitization was done — we need our own copy.
+                # 没有进行清理 — 我们需要自己的副本。
                 sanitized_messages = self._qwen_prepare_chat_messages(sanitized_messages)
             else:
-                # Already a deepcopy — transform in place to avoid a second deepcopy.
+                # 已经是深拷贝 — 就地转换以避免第二次深拷贝。
                 self._qwen_prepare_chat_messages_inplace(sanitized_messages)
 
-        # GPT-5 and Codex models respond better to 'developer' than 'system'
-        # for instruction-following.  Swap the role at the API boundary so
-        # internal message representation stays uniform ("system").
+        # GPT-5 和 Codex 模型对 'developer' 的响应比对 'system' 更好
+        # 用于指令遵循。在 API 边界交换角色，以便
+        # 内部消息表示保持统一（"system"）。
         _model_lower = (self.model or "").lower()
         if (
             sanitized_messages
             and sanitized_messages[0].get("role") == "system"
             and any(p in _model_lower for p in DEVELOPER_ROLE_MODELS)
         ):
-            # Shallow-copy the list + first message only — rest stays shared.
+            # 浅复制列表 + 仅第一条消息 — 其余保持共享。
             sanitized_messages = list(sanitized_messages)
             sanitized_messages[0] = {**sanitized_messages[0], "role": "developer"}
 
@@ -7050,9 +7048,9 @@ class AIAgent:
         if self.tools:
             api_kwargs["tools"] = self.tools
 
-        # ── max_tokens for chat_completions ──────────────────────────────
-        # Priority: ephemeral override (error recovery / length-continuation
-        # boost) > user-configured max_tokens > provider-specific defaults.
+        # ── chat_completions 的 max_tokens ──────────────────────────────
+        # 优先级：临时覆盖（错误恢复 / 长度延续
+        # 提升）> 用户配置的 max_tokens > 提供商特定默认值。
         _ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
         if _ephemeral_out is not None:
             self._ephemeral_max_output_tokens = None  # consume immediately
@@ -7060,27 +7058,25 @@ class AIAgent:
         elif self.max_tokens is not None:
             api_kwargs.update(self._max_tokens_param(self.max_tokens))
         elif "integrate.api.nvidia.com" in self._base_url_lower:
-            # NVIDIA NIM defaults to a very low max_tokens when omitted,
-            # causing models like GLM-4.7 to truncate immediately (thinking
-            # tokens alone exhaust the budget).  16384 provides adequate room.
+            # NVIDIA NIM 在省略时默认为非常低的 max_tokens，
+            # 导致像 GLM-4.7 这样的模型立即截断（仅思考
+            # 令牌就耗尽了预算）。16384 提供了足够的空间。
             api_kwargs.update(self._max_tokens_param(16384))
         elif self._is_qwen_portal():
-            # Qwen Portal defaults to a very low max_tokens when omitted.
-            # Reasoning models (qwen3-coder-plus) exhaust that budget on
-            # thinking tokens alone, causing the portal to return
-            # finish_reason="stop" with truncated output — the agent sees
-            # this as an intentional stop and exits the loop.  Send 65536
-            # (the documented max output for qwen3-coder models) so the
-            # model has adequate output budget for tool calls.
+            # Qwen Portal 在省略时默认为非常低的 max_tokens。
+            # 推理模型（qwen3-coder-plus）仅凭思考令牌就耗尽了该预算，
+            # 导致门户返回 finish_reason="stop" 和截断的输出 — 代理
+            # 将此视为有意停止并退出循环。发送 65536
+            #（qwen3-coder 模型的文档化最大输出）以便
+            # 模型有足够的输出预算进行工具调用。
             api_kwargs.update(self._max_tokens_param(65536))
         elif (self._is_openrouter_url() or "nousresearch" in self._base_url_lower) and "claude" in (self.model or "").lower():
-            # OpenRouter and Nous Portal translate requests to Anthropic's
-            # Messages API, which requires max_tokens as a mandatory field.
-            # When we omit it, the proxy picks a default that can be too
-            # low — the model spends its output budget on thinking and has
-            # almost nothing left for the actual response (especially large
-            # tool calls like write_file).  Sending the model's real output
-            # limit ensures full capacity.
+            # OpenRouter 和 Nous Portal 将请求转换为 Anthropic 的
+            # Messages API，这需要 max_tokens 作为必填字段。
+            # 当我们省略它时，代理选择一个可能太低的默认值 — 
+            # 模型将其输出预算花费在思考上，几乎没有什么留给
+            # 实际响应（尤其是像 write_file 这样的大型工具调用）。
+            # 发送模型的实际输出限制确保满容量。
             try:
                 from agent.anthropic_adapter import _get_anthropic_max_output
                 _model_output_limit = _get_anthropic_max_output(self.model)
@@ -7096,10 +7092,10 @@ class AIAgent:
             or "api.githubcopilot.com" in self._base_url_lower
         )
 
-        # Provider preferences (only, ignore, order, sort) are OpenRouter-
-        # specific.  Only send to OpenRouter-compatible endpoints.
-        # TODO: Nous Portal will add transparent proxy support — re-enable
-        # for _is_nous when their backend is updated.
+        # 提供商偏好（only、ignore、order、sort）是 OpenRouter-
+        # 特定的。仅发送到 OpenAI 兼容端点。
+        # TODO：Nous Portal 将添加透明代理支持 — 在其
+        # 后端更新时为 _is_nous 重新启用。
         if provider_preferences and _is_openrouter:
             extra_body["provider"] = provider_preferences
         _is_nous = "nousresearch" in self._base_url_lower
@@ -7112,8 +7108,8 @@ class AIAgent:
             else:
                 if self.reasoning_config is not None:
                     rc = dict(self.reasoning_config)
-                    # Nous Portal requires reasoning enabled — don't send
-                    # enabled=false to it (would cause 400).
+                    # Nous Portal 需要启用推理 — 不要向其发送
+                    # enabled=false（会导致 400）。
                     if _is_nous and rc.get("enabled") is False:
                         pass  # omit reasoning entirely for Nous when disabled
                     else:
@@ -7124,25 +7120,24 @@ class AIAgent:
                         "effort": "medium"
                     }
 
-        # Nous Portal product attribution
+        # Nous Portal 产品归属
         if _is_nous:
             extra_body["tags"] = ["product=hermes-agent"]
 
-        # Ollama num_ctx: override the 2048 default so the model actually
-        # uses the context window it was trained for.  Passed via the OpenAI
-        # SDK's extra_body → options.num_ctx, which Ollama's OpenAI-compat
-        # endpoint forwards to the runner as --ctx-size.
+        # Ollama num_ctx：覆盖 2048 默认值，以便模型实际
+        # 使用其训练的上下文窗口。通过 OpenAI
+        # SDK 的 extra_body → options.num_ctx 传递，Ollama 的 OpenAI 兼容
+        # 端点将其作为 --ctx-size 转发给运行器。
         if self._ollama_num_ctx:
             options = extra_body.get("options", {})
             options["num_ctx"] = self._ollama_num_ctx
             extra_body["options"] = options
 
-        # Ollama / custom provider: pass think=false when reasoning is disabled.
-        # Ollama does not recognise the OpenRouter-style `reasoning` extra_body
-        # field, so we use its native `think` parameter instead.
-        # This prevents thinking-capable models (Qwen3, etc.) from generating
-        # <think> blocks and producing empty-response errors when the user has
-        # set reasoning_effort: none.
+        # Ollama / 自定义提供商：在推理禁用时传递 think=false。
+        # Ollama 不识别 OpenRouter 风格的 `reasoning` extra_body
+        # 字段，因此我们改用其原生 `think` 参数。
+        # 这防止具有思考能力的模型（Qwen3 等）在用户
+        # 设置了 reasoning_effort: none 时生成 <think> 块并产生空响应错误。
         if self.provider == "custom" and self.reasoning_config and isinstance(self.reasoning_config, dict):
             _effort = (self.reasoning_config.get("effort") or "").strip().lower()
             _enabled = self.reasoning_config.get("enabled", True)
@@ -7155,19 +7150,19 @@ class AIAgent:
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
-        # Priority Processing / generic request overrides (e.g. service_tier).
-        # Applied last so overrides win over any defaults set above.
+        # 优先处理 / 通用请求覆盖（例如 service_tier）。
+        # 最后应用，以便覆盖胜过上面设置的任何默认值。
         if self.request_overrides:
             api_kwargs.update(self.request_overrides)
 
         return api_kwargs
 
     def _supports_reasoning_extra_body(self) -> bool:
-        """Return True when reasoning extra_body is safe to send for this route/model.
+        """当推理 extra_body 对此路由/模型安全发送时返回 True。
 
-        OpenRouter forwards unknown extra_body fields to upstream providers.
-        Some providers/routes reject `reasoning` with 400s, so gate it to
-        known reasoning-capable model families and direct Nous Portal.
+        OpenRouter 将未知的 extra_body 字段转发给上游提供商。
+        一些提供商/路由以 400 拒绝 `reasoning`，因此将其限制到
+        已知的推理能力模型系列和直接 Nous Portal。
         """
         if "nousresearch" in self._base_url_lower:
             return True
@@ -7197,7 +7192,7 @@ class AIAgent:
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
 
     def _github_models_reasoning_extra_body(self) -> dict | None:
-        """Format reasoning payload for GitHub Models/OpenAI-compatible routes."""
+        """为 GitHub Models/OpenAI 兼容路由格式化推理有效载荷。"""
         try:
             from hermes_cli.models import github_model_reasoning_efforts
         except Exception:
@@ -7229,10 +7224,10 @@ class AIAgent:
         return {"effort": requested_effort}
 
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
-        """Build a normalized assistant message dict from an API response message.
+        """从 API 响应消息构建标准化的助手消息字典。
 
-        Handles reasoning extraction, reasoning_details, and optional tool_calls
-        so both the tool-call path and the final-response path share one builder.
+        处理推理提取、reasoning_details 和可选的 tool_calls，
+        以便工具调用路径和最终响应路径共享一个构建器。
         """
         reasoning_text = self._extract_reasoning(assistant_message)
         _from_structured = bool(reasoning_text)
@@ -7265,8 +7260,8 @@ class AIAgent:
                 except Exception:
                     pass
 
-        # Sanitize surrogates from API response — some models (e.g. Kimi/GLM via Ollama)
-        # can return invalid surrogate code points that crash json.dumps() on persist.
+        # 清理 API 响应中的代理项 — 某些模型（例如通过 Ollama 的 Kimi/GLM）
+        # 可能返回无效的代理码点，导致持久化时 json.dumps() 崩溃。
         _raw_content = assistant_message.content or ""
         _san_content = _sanitize_surrogates(_raw_content)
         if reasoning_text:
@@ -7294,10 +7289,10 @@ class AIAgent:
         }
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
-            # Pass reasoning_details back unmodified so providers (OpenRouter,
-            # Anthropic, OpenAI) can maintain reasoning continuity across turns.
-            # Each provider may include opaque fields (signature, encrypted_content)
-            # that must be preserved exactly.
+            # 未经修改地传回 reasoning_details，以便提供商（OpenRouter、
+            # Anthropic、OpenAI）可以在回合之间保持推理连续性。
+            # 每个提供商可能包含必须完全保留的不透明字段
+            # （signature、encrypted_content）。
             raw_details = assistant_message.reasoning_details
             preserved = []
             for d in raw_details:
@@ -7310,8 +7305,8 @@ class AIAgent:
             if preserved:
                 msg["reasoning_details"] = preserved
 
-        # Codex Responses API: preserve encrypted reasoning items for
-        # multi-turn continuity. These get replayed as input on the next turn.
+        # Codex Responses API：保留加密推理项以实现
+        # 多回合连续性。这些在下一回合作为输入重放。
         codex_items = getattr(assistant_message, "codex_reasoning_items", None)
         if codex_items:
             msg["codex_reasoning_items"] = codex_items
@@ -7354,9 +7349,9 @@ class AIAgent:
                         "arguments": tool_call.function.arguments
                     },
                 }
-                # Preserve extra_content (e.g. Gemini thought_signature) so it
-                # is sent back on subsequent API calls.  Without this, Gemini 3
-                # thinking models reject the request with a 400 error.
+                # 保留 extra_content（例如 Gemini thought_signature），以便
+                # 它在后续 API 调用中发回。没有这个，Gemini 3
+                # 思考模型会以 400 错误拒绝请求。
                 extra = getattr(tool_call, "extra_content", None)
                 if extra is not None:
                     if hasattr(extra, "model_dump"):
@@ -7369,20 +7364,20 @@ class AIAgent:
 
     @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
-        """Strip Codex Responses API fields from tool_calls for strict providers.
+        """为严格提供商从 tool_calls 中剥离 Codex Responses API 字段。
 
-        Providers like Mistral, Fireworks, and other strict OpenAI-compatible APIs
-        validate the Chat Completions schema and reject unknown fields (call_id,
-        response_item_id) with 400 or 422 errors. These fields are preserved in
-        the internal message history — this method only modifies the outgoing
-        API copy.
+        像 Mistral、Fireworks 和其他严格的 OpenAI 兼容 API
+        这样的提供商验证 Chat Completions 模式并以 400 或 422 错误
+        拒绝未知字段（call_id、response_item_id）。这些字段保留在
+        内部消息历史中 — 此方法仅修改传出的
+        API 副本。
 
-        Creates new tool_call dicts rather than mutating in-place, so the
-        original messages list retains call_id/response_item_id for Codex
-        Responses API compatibility (e.g. if the session falls back to a
-        Codex provider later).
+        创建新的 tool_call 字典而不是就地变异，以便
+        原始消息列表为 Codex Responses API 兼容性保留
+        call_id/response_item_id（例如，如果会话稍后回退到
+        Codex 提供商）。
 
-        Fields stripped: call_id, response_item_id
+        剥离的字段：call_id、response_item_id
         """
         tool_calls = api_msg.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -7396,31 +7391,31 @@ class AIAgent:
         return api_msg
 
     def _should_sanitize_tool_calls(self) -> bool:
-        """Determine if tool_calls need sanitization for strict APIs.
+        """确定 tool_calls 是否需要为严格 API 进行清理。
 
-        Codex Responses API uses fields like call_id and response_item_id
-        that are not part of the standard Chat Completions schema. These
-        fields must be stripped when calling any other API to avoid
-        validation errors (400 Bad Request).
+        Codex Responses API 使用像 call_id 和 response_item_id
+        这样的字段，这些字段不是标准 Chat Completions 模式的一部分。
+        调用任何其他 API 时必须剥离这些字段以避免
+        验证错误（400 Bad Request）。
 
-        Returns:
-            bool: True if sanitization is needed (non-Codex API), False otherwise.
+        返回：
+            bool：如果需要清理则为 True（非 Codex API），否则为 False。
         """
         return self.api_mode != "codex_responses"
 
     def flush_memories(self, messages: list = None, min_turns: int = None):
-        """Give the model one turn to persist memories before context is lost.
+        """在上下文丢失之前给模型一个回合来持久化内存。
 
-        Called before compression, session reset, or CLI exit. Injects a flush
-        message, makes one API call, executes any memory tool calls, then
-        strips all flush artifacts from the message list.
+        在压缩、会话重置或 CLI 退出之前调用。注入刷新消息，
+        进行一次 API 调用，执行任何内存工具调用，然后
+        从消息列表中剥离所有刷新产物。
 
-        Args:
-            messages: The current conversation messages. If None, uses
-                      self._session_messages (last run_conversation state).
-            min_turns: Minimum user turns required to trigger the flush.
-                       None = use config value (flush_min_turns).
-                       0 = always flush (used for compression).
+        参数：
+            messages：当前对话消息。如果为 None，则使用
+                      self._session_messages（最后一次 run_conversation 状态）。
+            min_turns：触发刷新所需的最少用户回合数。
+                       None = 使用配置值（flush_min_turns）。
+                       0 = 始终刷新（用于压缩）。
         """
         if self._memory_flush_min_turns == 0 and min_turns is None:
             return
@@ -7445,7 +7440,7 @@ class AIAgent:
         messages.append(flush_msg)
 
         try:
-            # Build API messages for the flush call
+            # 为刷新调用构建 API 消息
             _needs_sanitize = self._should_sanitize_tool_calls()
             api_messages = []
             for msg in messages:
@@ -7465,7 +7460,7 @@ class AIAgent:
             if self._cached_system_prompt:
                 api_messages = [{"role": "system", "content": self._cached_system_prompt}] + api_messages
 
-            # Make one API call with only the memory tool available
+            # 仅使用内存工具进行一次 API 调用
             memory_tool_def = None
             for t in (self.tools or []):
                 if t.get("function", {}).get("name") == "memory":
@@ -7476,15 +7471,15 @@ class AIAgent:
                 messages.pop()  # remove flush msg
                 return
 
-            # Use auxiliary client for the flush call when available --
-            # it's cheaper and avoids Codex Responses API incompatibility.
+            # 在可用时使用辅助客户端进行刷新调用 —
+            # 它更便宜并避免 Codex Responses API 不兼容性。
             from agent.auxiliary_client import (
                 call_llm as _call_llm,
                 _fixed_temperature_for_model,
             )
             _aux_available = True
-            # Use the fixed-temperature override (e.g. kimi-for-coding → 0.6) if
-            # the model has a strict contract; otherwise the historical 0.3 default.
+            # 如果模型有严格合同，使用固定温度覆盖（例如 kimi-for-coding → 0.6）；
+            # 否则使用历史 0.3 默认值。
             _flush_temperature = _fixed_temperature_for_model(self.model)
             if _flush_temperature is None:
                 _flush_temperature = 0.3
@@ -7502,7 +7497,7 @@ class AIAgent:
                 response = None
 
             if not _aux_available and self.api_mode == "codex_responses":
-                # No auxiliary client -- use the Codex Responses path directly
+                # 没有辅助客户端 — 直接使用 Codex Responses 路径
                 codex_kwargs = self._build_api_kwargs(api_messages)
                 codex_kwargs["tools"] = self._responses_tools([memory_tool_def])
                 codex_kwargs["temperature"] = _flush_temperature
@@ -7510,7 +7505,7 @@ class AIAgent:
                     codex_kwargs["max_output_tokens"] = 5120
                 response = self._run_codex_stream(codex_kwargs)
             elif not _aux_available and self.api_mode == "anthropic_messages":
-                # Native Anthropic — use the Anthropic client directly
+                # 原生 Anthropic — 直接使用 Anthropic 客户端
                 from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
                 ant_kwargs = _build_ant_kwargs(
                     model=self.model, messages=api_messages,
@@ -7532,7 +7527,7 @@ class AIAgent:
                     **api_kwargs, timeout=_get_task_timeout("flush_memories")
                 )
 
-            # Extract tool calls from the response, handling all API formats
+            # 从响应中提取工具调用，处理所有 API 格式
             tool_calls = []
             if self.api_mode == "codex_responses" and not _aux_available:
                 assistant_msg, _ = self._normalize_codex_response(response)
@@ -7568,8 +7563,8 @@ class AIAgent:
         except Exception as e:
             logger.debug("Memory flush API call failed: %s", e)
         finally:
-            # Strip flush artifacts: remove everything from the flush message onward.
-            # Use sentinel marker instead of identity check for robustness.
+            # 剥离刷新产物：从刷新消息开始删除所有内容。
+            # 使用哨兵标记而不是身份检查以实现鲁棒性。
             while messages and messages[-1].get("_flush_sentinel") != _sentinel:
                 messages.pop()
                 if not messages:
@@ -7578,15 +7573,15 @@ class AIAgent:
                 messages.pop()
 
     def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
-        """Compress conversation context and split the session in SQLite.
+        """压缩对话上下文并在 SQLite 中拆分会话。
 
-        Args:
-            focus_topic: Optional focus string for guided compression — the
-                summariser will prioritise preserving information related to
-                this topic.  Inspired by Claude Code's ``/compact <focus>``.
+        参数：
+            focus_topic：用于引导压缩的可选焦点字符串 — 
+                总结器将优先保留与此主题相关的信息。
+                受 Claude Code 的 ``/compact <focus>`` 启发。
 
-        Returns:
-            (compressed_messages, new_system_prompt) tuple
+        返回：
+            (compressed_messages, new_system_prompt) 元组
         """
         _pre_msg_count = len(messages)
         logger.info(
@@ -7595,10 +7590,10 @@ class AIAgent:
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
             focus_topic,
         )
-        # Pre-compression memory flush: let the model save memories before they're lost
+        # 压缩前内存刷新：让模型在内存丢失前保存它们
         self.flush_memories(messages, min_turns=0)
 
-        # Notify external memory provider before compression discards context
+        # 在压缩丢弃上下文之前通知外部内存提供商
         if self._memory_manager:
             try:
                 self._memory_manager.on_pre_compress(messages)
@@ -7617,9 +7612,9 @@ class AIAgent:
 
         if self._session_db:
             try:
-                # Propagate title to the new session with auto-numbering
+                # 将标题传播到新会话并自动编号
                 old_title = self._session_db.get_session_title(self.session_id)
-                # Trigger memory extraction on the old session before it rotates.
+                # 在旧会话轮换之前触发内存提取。
                 self.commit_memory_session(messages)
                 self._session_db.end_session(self.session_id, "compression")
                 old_session_id = self.session_id
@@ -7632,7 +7627,7 @@ class AIAgent:
                     model=self.model,
                     parent_session_id=old_session_id,
                 )
-                # Auto-number the title for the continuation session
+                # 为继续会话自动编号标题
                 if old_title:
                     try:
                         new_title = self._session_db.get_next_title_in_lineage(old_title)
@@ -7640,12 +7635,12 @@ class AIAgent:
                     except (ValueError, Exception) as e:
                         logger.debug("Could not propagate title on compression: %s", e)
                 self._session_db.update_system_prompt(self.session_id, new_system_prompt)
-                # Reset flush cursor — new session starts with no messages written
+                # 重置刷新游标 — 新会话开始时没有写入消息
                 self._last_flushed_db_idx = 0
             except Exception as e:
                 logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
 
-        # Warn on repeated compressions (quality degrades with each pass)
+        # 警告重复压缩（每次传递质量下降）
         _cc = self.context_compressor.compression_count
         if _cc >= 2:
             self._vprint(
@@ -7654,8 +7649,8 @@ class AIAgent:
                 force=True,
             )
 
-        # Update token estimate after compaction so pressure calculations
-        # use the post-compression count, not the stale pre-compression one.
+        # 压缩后更新令牌估计，以便压力计算
+        # 使用压缩后计数，而不是陈旧的压缩前计数。
         _compressed_est = (
             estimate_tokens_rough(new_system_prompt)
             + estimate_messages_tokens_rough(compressed)
@@ -7663,9 +7658,9 @@ class AIAgent:
         self.context_compressor.last_prompt_tokens = _compressed_est
         self.context_compressor.last_completion_tokens = 0
 
-        # Clear the file-read dedup cache.  After compression the original
-        # read content is summarised away — if the model re-reads the same
-        # file it needs the full content, not a "file unchanged" stub.
+        # 清除文件读取去重缓存。压缩后原始
+        # 读取内容被总结掉 — 如果模型重新读取相同
+        # 的文件，它需要完整内容，而不是"文件未更改"存根。
         try:
             from tools.file_tools import reset_file_dedup
             reset_file_dedup(task_id)
@@ -7680,15 +7675,15 @@ class AIAgent:
         return compressed, new_system_prompt
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute tool calls from the assistant message and append results to messages.
+        """从助手消息执行工具调用并将结果附加到消息。
 
-        Dispatches to concurrent execution only for batches that look
-        independent: read-only tools may always share the parallel path, while
+        仅调度看起来独立的批次进行并发执行：
+        只读工具可能始终共享并行路径，而
         file reads/writes may do so only when their target paths do not overlap.
         """
         tool_calls = assistant_message.tool_calls
 
-        # Allow _vprint during tool execution even with stream consumers
+        # 即使有流式消费者也允许在工具执行期间使用 _vprint
         self._executing_tools = True
         try:
             if not _should_parallelize_tool_batch(tool_calls):
@@ -7704,13 +7699,13 @@ class AIAgent:
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
-        """Invoke a single tool and return the result string. No display logic.
+        """调用单个工具并返回结果字符串。无显示逻辑。
 
-        Handles both agent-level tools (todo, memory, etc.) and registry-dispatched
-        tools. Used by the concurrent execution path; the sequential path retains
-        its own inline invocation for backward-compatible display handling.
+        处理代理级工具（todo、memory 等）和注册表分发的
+        工具。由并发执行路径使用；顺序路径保留
+        其自己的内联调用以实现向后兼容的显示处理。
         """
-        # Check plugin hooks for a block directive before executing anything.
+        # 在执行任何操作之前检查插件钩子的阻止指令。
         block_message: Optional[str] = None
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
@@ -7791,12 +7786,12 @@ class AIAgent:
 
     @staticmethod
     def _wrap_verbose(label: str, text: str, indent: str = "     ") -> str:
-        """Word-wrap verbose tool output to fit the terminal width.
+        """将详细工具输出自动换行以适应终端宽度。
 
-        Splits *text* on existing newlines and wraps each line individually,
-        preserving intentional line breaks (e.g. pretty-printed JSON).
-        Returns a ready-to-print string with *label* on the first line and
-        continuation lines indented.
+        在现有换行符上分割 *text* 并单独包装每一行，
+        保留有意换行符（例如漂亮打印的 JSON）。
+        返回准备打印的字符串，第一行有 *label*，
+        续行缩进。
         """
         import shutil as _shutil
         import textwrap as _tw
@@ -7815,15 +7810,15 @@ class AIAgent:
         return f"{indent}{label}{body}"
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute multiple tool calls concurrently using a thread pool.
+        """使用线程池并发执行多个工具调用。
 
-        Results are collected in the original tool-call order and appended to
-        messages so the API sees them in the expected sequence.
+        结果按原始工具调用顺序收集并附加到
+        消息，以便 API 按预期顺序看到它们。
         """
         tool_calls = assistant_message.tool_calls
         num_tools = len(tool_calls)
 
-        # ── Pre-flight: interrupt check ──────────────────────────────────
+        # ── 预检：中断检查 ──────────────────────────────────
         if self._interrupt_requested:
             print(f"{self.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
             for tc in tool_calls:
@@ -7834,7 +7829,7 @@ class AIAgent:
                 })
             return
 
-        # ── Parse args + pre-execution bookkeeping ───────────────────────
+        # ── 解析参数 + 执行前簿记 ───────────────────────
         parsed_calls = []  # list of (tool_call, function_name, function_args)
         for tool_call in tool_calls:
             function_name = tool_call.function.name
@@ -7843,7 +7838,7 @@ class AIAgent:
             if function_name == "memory":
                 self._turns_since_memory = 0
             elif function_name == "skill_manage":
-                self._iters_since_skill = 0
+                self.skill_evolution.on_tool_invoked(function_name)
 
             try:
                 function_args = json.loads(tool_call.function.arguments)
@@ -7852,7 +7847,7 @@ class AIAgent:
             if not isinstance(function_args, dict):
                 function_args = {}
 
-            # Checkpoint for file-mutating tools
+            # 文件变异工具的检查点
             if function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
@@ -7876,7 +7871,7 @@ class AIAgent:
 
             parsed_calls.append((tool_call, function_name, function_args))
 
-        # ── Logging / callbacks ──────────────────────────────────────────
+        # ── 日志记录 / 回调 ──────────────────────────────────────────
         tool_names_str = ", ".join(name for _, name, _ in parsed_calls)
         if not self.quiet_mode:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
@@ -7904,37 +7899,37 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
-        # ── Concurrent execution ─────────────────────────────────────────
-        # Each slot holds (function_name, function_args, function_result, duration, error_flag)
+        # ── 并发执行 ─────────────────────────────────────────
+        # 每个槽保存 (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
 
-        # Touch activity before launching workers so the gateway knows
-        # we're executing tools (not stuck).
+        # 在启动工作线程之前触摸活动，以便网关知道
+        # 我们正在执行工具（而不是卡住）。
         self._current_tool = tool_names_str
         self._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
 
         def _run_tool(index, tool_call, function_name, function_args):
-            """Worker function executed in a thread."""
-            # Register this worker tid so the agent can fan out an interrupt
-            # to it — see AIAgent.interrupt().  Must happen first thing, and
-            # must be paired with discard + clear in the finally block.
+            """在线程中执行的工作函数。"""
+            # 注册此工作线程 tid，以便代理可以向其
+            # 扩散中断 — 见 AIAgent.interrupt()。
+            # 必须首先发生，并且必须与 finally 块中的 discard + clear 配对。
             _worker_tid = threading.current_thread().ident
             with self._tool_worker_threads_lock:
                 self._tool_worker_threads.add(_worker_tid)
-            # Race: if the agent was interrupted between fan-out (which
-            # snapshotted an empty/earlier set) and our registration, apply
-            # the interrupt to our own tid now so is_interrupted() inside
-            # the tool returns True on the next poll.
+            # 竞争：如果代理在扩散（快照了空/早期集合）
+            # 和我们的注册之间被中断，现在将中断
+            # 应用到我们自己的 tid，以便工具内的 is_interrupted()
+            # 在下一次轮询时返回 True。
             if self._interrupt_requested:
                 try:
                     from tools.interrupt import set_interrupt as _sif
                     _sif(True, _worker_tid)
                 except Exception:
                     pass
-            # Set the activity callback on THIS worker thread so
-            # _wait_for_process (terminal commands) can fire heartbeats.
-            # The callback is thread-local; the main thread's callback
-            # is invisible to worker threads.
+            # 在此工作线程上设置活动回调，以便
+            # _wait_for_process（终端命令）可以触发心跳。
+            # 回调是线程本地的；主线程的回调
+            # 对工作线程不可见。
             try:
                 from tools.environments.base import set_activity_callback
                 set_activity_callback(self._touch_activity)
@@ -7953,9 +7948,9 @@ class AIAgent:
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
             results[index] = (function_name, function_args, result, duration, is_error)
-            # Tear down worker-tid tracking.  Clear any interrupt bit we may
-            # have set so the next task scheduled onto this recycled tid
-            # starts with a clean slate.
+            # 拆除工作线程 tid 跟踪。清除我们可能
+            # 设置的任何中断位，以便调度到此回收 tid 的
+            # 下一个任务以干净的状态开始。
             with self._tool_worker_threads_lock:
                 self._tool_worker_threads.discard(_worker_tid)
             try:
@@ -7964,7 +7959,7 @@ class AIAgent:
             except Exception:
                 pass
 
-        # Start spinner for CLI mode (skip when TUI handles tool progress)
+        # 为 CLI 模式启动旋转器（TUI 处理工具进度时跳过）
         spinner = None
         if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
             face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -7979,11 +7974,12 @@ class AIAgent:
                     f = executor.submit(_run_tool, i, tc, name, args)
                     futures.append(f)
 
-                # Wait for all to complete with periodic heartbeats so the
-                # gateway's inactivity monitor doesn't kill us during long
-                # concurrent tool batches.  Also check for user interrupts
-                # so we don't block indefinitely when the user sends /stop
-                # or a new message during concurrent tool execution.
+                # 等待所有完成并定期心跳，以便
+                # 网关的非活动监视器在长时间
+                # 并发工具批次期间不会杀死我们。
+                # 同时检查用户中断，
+                # 以便当用户在并发工具执行期间发送 /stop
+                # 或新消息时我们不会无限期阻塞。
                 _conc_start = time.time()
                 _interrupt_logged = False
                 while True:
@@ -7993,11 +7989,11 @@ class AIAgent:
                     if not not_done:
                         break
 
-                    # Check for interrupt — the per-thread interrupt signal
-                    # already causes individual tools (terminal, execute_code)
-                    # to abort, but tools without interrupt checks (web_search,
-                    # read_file) will run to completion.  Cancel any futures
-                    # that haven't started yet so we don't block on them.
+                    # 检查中断 — 每线程中断信号
+                    # 已经导致单个工具（terminal、execute_code）
+                    # 中止，但没有中断检查的工具（web_search、
+                    # read_file）将运行到完成。取消任何尚未
+                    # 开始的期货，这样我们就不会阻塞它们。
                     if self._interrupt_requested:
                         if not _interrupt_logged:
                             _interrupt_logged = True
@@ -8008,13 +8004,13 @@ class AIAgent:
                             )
                         for f in not_done:
                             f.cancel()
-                        # Give already-running tools a moment to notice the
-                        # per-thread interrupt signal and exit gracefully.
+                        # 给已经运行的工具一点时间来注意
+                        # 每线程中断信号并优雅退出。
                         concurrent.futures.wait(not_done, timeout=3.0)
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)
-                    # Heartbeat every ~30s (6 × 5s poll intervals)
+                    # 每 ~30s 心跳一次（6 × 5s 轮询间隔）
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                         _still_running = [
                             parsed_calls[futures.index(f)][1]
@@ -8027,16 +8023,16 @@ class AIAgent:
                         )
         finally:
             if spinner:
-                # Build a summary message for the spinner stop
+                # 为旋转器停止构建摘要消息
                 completed = sum(1 for r in results if r is not None)
                 total_dur = sum(r[3] for r in results if r is not None)
                 spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
-        # ── Post-execution: display per-tool results ─────────────────────
+        # ── 执行后：显示每个工具的结果 ─────────────────────
         for i, (tc, name, args) in enumerate(parsed_calls):
             r = results[i]
             if r is None:
-                # Tool was cancelled (interrupt) or thread didn't return
+                # 工具被取消（中断）或线程未返回
                 if self._interrupt_requested:
                     function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
                 else:
@@ -8062,7 +8058,7 @@ class AIAgent:
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                     logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
-            # Print cute message per tool
+            # 为每个工具打印可爱消息
             if self._should_emit_quiet_tool_messages():
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
                 self._safe_print(f"  {cute_msg}")
@@ -8107,19 +8103,19 @@ class AIAgent:
             turn_tool_msgs = messages[-num_tools:]
             enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id))
 
-        # ── /steer injection ──────────────────────────────────────────────
-        # Append any pending user steer text to the last tool result so the
-        # agent sees it on its next iteration. Runs AFTER budget enforcement
-        # so the steer marker is never truncated. See steer() for details.
+        # ── /steer 注入 ──────────────────────────────────────────────
+        # 将任何待处理的用户转向文本附加到最后一个工具结果，以便
+        # 代理在其下一次迭代中看到它。在预算执行之后运行，
+        # 因此转向标记永远不会被截断。详情见 steer()。
         if num_tools > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools)
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
-        """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
+        """顺序执行工具调用（原始行为）。用于单个调用或交互式工具。"""
         for i, tool_call in enumerate(assistant_message.tool_calls, 1):
-            # SAFETY: check interrupt BEFORE starting each tool.
-            # If the user sent "stop" during a previous tool's execution,
-            # do NOT start any more tools -- skip them all immediately.
+            # 安全：在开始每个工具之前检查中断。
+            # 如果用户在先前工具的执行期间发送了"stop"，
+            # 则不要启动任何更多工具 — 立即跳过它们。
             if self._interrupt_requested:
                 remaining_calls = assistant_message.tool_calls[i-1:]
                 if remaining_calls:
@@ -8155,15 +8151,15 @@ class AIAgent:
                 pass
 
             if _block_msg is not None:
-                # Tool blocked by plugin policy — skip counter resets.
-                # Execution is handled below in the tool dispatch chain.
+                # 工具被插件策略阻止 — 跳过计数器重置。
+                # 执行在下面的工具调度链中处理。
                 pass
             else:
-                # Reset nudge counters when the relevant tool is actually used
+                # 当相关工具实际使用时重置提醒计数器
                 if function_name == "memory":
                     self._turns_since_memory = 0
                 elif function_name == "skill_manage":
-                    self._iters_since_skill = 0
+                    self.skill_evolution.on_tool_invoked(function_name)
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
@@ -8178,9 +8174,9 @@ class AIAgent:
                 self._current_tool = function_name
                 self._touch_activity(f"executing tool: {function_name}")
 
-            # Set activity callback for long-running tool execution (terminal
-            # commands, etc.) so the gateway's inactivity monitor doesn't kill
-            # the agent while a command is running.
+            # 为长时间运行的工具执行（终端
+            # 命令等）设置活动回调，以便网关的非活动监视器
+            # 在命令运行时不会杀死代理。
             if _block_msg is None:
                 try:
                     from tools.environments.base import set_activity_callback
@@ -8201,7 +8197,7 @@ class AIAgent:
                 except Exception as cb_err:
                     logging.debug(f"Tool start callback error: {cb_err}")
 
-            # Checkpoint: snapshot working dir before file-mutating tools
+            # 检查点：在文件变异工具之前快照工作目录
             if _block_msg is None and function_name in ("write_file", "patch") and self._checkpoint_mgr.enabled:
                 try:
                     file_path = function_args.get("path", "")
@@ -8228,7 +8224,7 @@ class AIAgent:
             tool_start_time = time.time()
 
             if _block_msg is not None:
-                # Tool blocked by plugin policy — return error without executing.
+                # 工具被插件策略阻止 — 返回错误而不执行。
                 function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
                 tool_duration = 0.0
             elif function_name == "todo":
@@ -8266,7 +8262,7 @@ class AIAgent:
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
                 )
-                # Bridge: notify external memory provider of built-in memory writes
+                # 桥接：通知外部内存提供商内置内存写入
                 if self._memory_manager and function_args.get("action") in ("add", "replace"):
                     try:
                         self._memory_manager.on_memory_write(
@@ -8323,7 +8319,7 @@ class AIAgent:
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
             elif self._context_engine_tool_names and function_name in self._context_engine_tool_names:
-                # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
+                # 上下文引擎工具（lcm_grep、lcm_describe、lcm_expand 等）
                 spinner = None
                 if self._should_emit_quiet_tool_messages():
                     face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -8346,8 +8342,8 @@ class AIAgent:
                     elif self._should_emit_quiet_tool_messages():
                         self._vprint(f"  {cute_msg}")
             elif self._memory_manager and self._memory_manager.has_tool(function_name):
-                # Memory provider tools (hindsight_retain, honcho_search, etc.)
-                # These are not in the tool registry — route through MemoryManager.
+                # 内存提供商工具（hindsight_retain、honcho_search 等）
+                # 这些不在工具注册表中 — 通过 MemoryManager 路由。
                 spinner = None
                 if self._should_emit_quiet_tool_messages() and self._should_start_quiet_spinner():
                     face = random.choice(KawaiiSpinner.get_waiting_faces())
@@ -8415,8 +8411,8 @@ class AIAgent:
                 function_result[:200] if len(function_result) > 200 else function_result
             )
 
-            # Log tool errors to the persistent error log so [error] tags
-            # in the UI always have a corresponding detailed entry on disk.
+            # 将工具错误记录到持久错误日志，以便 UI 中的 [error] 标签
+            # 始终在磁盘上有相应的详细条目。
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -8452,7 +8448,7 @@ class AIAgent:
                 env=get_active_env(effective_task_id),
             )
 
-            # Discover subdirectory context files from tool arguments
+            # 从工具参数发现子目录上下文文件
             subdir_hints = self._subdirectory_hints.check_tool_call(function_name, function_args)
             if subdir_hints:
                 function_result += subdir_hints
@@ -8493,16 +8489,16 @@ class AIAgent:
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
 
-        # ── /steer injection ──────────────────────────────────────────────
-        # See _execute_tool_calls_parallel for the rationale. Same hook,
-        # applied to sequential execution as well.
+        # ── /steer 注入 ──────────────────────────────────────────────
+        # 基本原理见 _execute_tool_calls_parallel。相同的钩子，
+        # 也应用于顺序执行。
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
 
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
-        """Request a summary when max iterations are reached. Returns the final response text."""
+        """当达到最大迭代次数时请求摘要。返回最终响应文本。"""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
 
         summary_request = (
@@ -8513,8 +8509,8 @@ class AIAgent:
         messages.append({"role": "user", "content": summary_request})
 
         try:
-            # Build API messages, stripping internal-only fields
-            # (finish_reason, reasoning) that strict APIs like Mistral reject with 422
+            # 构建 API 消息，剥离仅内部字段
+            # （finish_reason、reasoning），严格 API 如 Mistral 以 422 拒绝
             _needs_sanitize = self._should_sanitize_tool_calls()
             api_messages = []
             for msg in messages:
@@ -8614,7 +8610,7 @@ class AIAgent:
                 else:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
-                # Retry summary generation
+                # 重试摘要生成
                 if self.api_mode == "codex_responses":
                     codex_kwargs = self._build_api_kwargs(api_messages)
                     codex_kwargs.pop("tools", None)
@@ -8675,65 +8671,66 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Run a complete conversation with tool calling until completion.
+        运行完整的工具调用对话直到完成。
 
-        Args:
-            user_message (str): The user's message/question
-            system_message (str): Custom system message (optional, overrides ephemeral_system_prompt if provided)
-            conversation_history (List[Dict]): Previous conversation messages (optional)
-            task_id (str): Unique identifier for this task to isolate VMs between concurrent tasks (optional, auto-generated if not provided)
-            stream_callback: Optional callback invoked with each text delta during streaming.
-                Used by the TTS pipeline to start audio generation before the full response.
-                When None (default), API calls use the standard non-streaming path.
-            persist_user_message: Optional clean user message to store in
-                transcripts/history when user_message contains API-only
-                synthetic prefixes.
-                    or queuing follow-up prefetch work.
+        参数：
+            user_message (str)：用户的消息/问题
+            system_message (str)：自定义系统消息（可选，如果提供则覆盖 ephemeral_system_prompt）
+            conversation_history (List[Dict])：先前的对话消息（可选）
+            task_id (str)：此任务的唯一标识符，用于在并发任务之间隔离 VM（可选，如果未提供则自动生成）
+            stream_callback：在流式传输期间使用每个文本增量调用的可选回调。
+                TTS 管道使用它在完整响应之前开始音频生成。
+                当为 None（默认）时，API 调用使用标准非流式路径。
+            persist_user_message：可选的干净用户消息，用于在
+                user_message 包含仅 API 的
+                合成前缀时存储在记录/历史中。
+                    或排队后续预取工作。
 
-        Returns:
-            Dict: Complete conversation result with final response and message history
+        返回：
+            Dict：完整的对话结果，包含最终响应和消息历史
         """
-        # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
-        # Installed once, transparent when streams are healthy, prevents crash on write.
+        # 保护 stdio 免受管道破裂的 OSError（systemd/headless/daemon）。
+        # 安装一次，流健康时透明，防止写入时崩溃。
         _install_safe_stdio()
 
-        # Tag all log records on this thread with the session ID so
-        # ``hermes logs --session <id>`` can filter a single conversation.
+        # 在此线程上使用会话 ID 标记所有日志记录，以便
+        # ``hermes logs --session <id>`` 可以过滤单个对话。
         from hermes_logging import set_session_context
         set_session_context(self.session_id)
 
-        # If the previous turn activated fallback, restore the primary
-        # runtime so this turn gets a fresh attempt with the preferred model.
-        # No-op when _fallback_activated is False (gateway, first turn, etc.).
+        # 如果上一回合激活了回退，恢复主
+        # 运行时，以便此回合使用首选模型进行全新尝试。
+        # 当 _fallback_activated 为 False 时无操作（网关、第一回合等）。
         self._restore_primary_runtime()
 
-        # Sanitize surrogate characters from user input.  Clipboard paste from
-        # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
-        # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
+        # 清理用户输入中的代理项字符。从
+        # 富文本编辑器（Google Docs、Word 等）剪贴板粘贴
+        # 可以注入无效 UTF-8 的单独代理项，
+        # 并导致 OpenAI SDK 中的 JSON 序列化崩溃。
         if isinstance(user_message, str):
             user_message = _sanitize_surrogates(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = _sanitize_surrogates(persist_user_message)
 
-        # Strip leaked <memory-context> blocks from user input.  When Honcho's
-        # saveMessages persists a turn that included injected context, the block
-        # can reappear in the next turn's user message via message history.
-        # Stripping here prevents stale memory tags from leaking into the
-        # conversation and being visible to the user or the model as user text.
+        # 从用户输入中剥离泄漏的 <memory-context> 块。当 Honcho 的
+        # saveMessages 持久化包含注入上下文的回合时，该块
+        # 可以通过消息历史在下一回合的用户消息中重新出现。
+        # 此处剥离可防止过时的内存标签泄漏到
+        # 对话中，并被用户或模型作为用户文本看到。
         if isinstance(user_message, str):
             user_message = sanitize_context(user_message)
         if isinstance(persist_user_message, str):
             persist_user_message = sanitize_context(persist_user_message)
 
-        # Store stream callback for _interruptible_api_call to pick up
+        # 存储流式回调供 _interruptible_api_call 使用
         self._stream_callback = stream_callback
         self._persist_user_message_idx = None
         self._persist_user_message_override = persist_user_message
-        # Generate unique task_id if not provided to isolate VMs between concurrent tasks
+        # 如果未提供，则生成唯一的 task_id 以在并发任务之间隔离 VM
         effective_task_id = task_id or str(uuid.uuid4())
         
-        # Reset retry counters and iteration budget at the start of each turn
-        # so subagent usage from a previous turn doesn't eat into the next one.
+        # 在每个回合开始时重置重试计数器和迭代预算
+        # 以便上一回合的子代理使用不会占用下一回合的预算。
         self._invalid_tool_retries = 0
         self._invalid_json_retries = 0
         self._empty_content_retries = 0
@@ -8746,9 +8743,9 @@ class AIAgent:
         self._mute_post_response = False
         self._unicode_sanitization_passes = 0
 
-        # Pre-turn connection health check: detect and clean up dead TCP
-        # connections left over from provider outages or dropped streams.
-        # This prevents the next API call from hanging on a zombie socket.
+        # 回合前连接健康检查：检测并清理来自
+        # 提供商中断或丢弃流留下的死 TCP
+        # 连接。这防止下一次 API 调用在僵尸套接字上挂起。
         if self.api_mode != "anthropic_messages":
             try:
                 if self._cleanup_dead_connections():
@@ -8759,18 +8756,18 @@ class AIAgent:
                     )
             except Exception:
                 pass
-        # Replay compression warning through status_callback for gateway
-        # platforms (the callback was not wired during __init__).
+        # 通过 status_callback 为网关
+        # 平台重放压缩警告（回调在 __init__ 期间未连接）。
         if self._compression_warning:
             self._replay_compression_warning()
             self._compression_warning = None  # send once
 
-        # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
-        # They are initialized in __init__ and must persist across run_conversation
-        # calls so that nudge logic accumulates correctly in CLI mode.
+        # 注意：_turns_since_memory 和 _iters_since_skill 此处不重置。
+        # 它们在 __init__ 中初始化，必须在 run_conversation
+        # 调用之间持久存在，以便提醒逻辑在 CLI 模式下正确累积。
         self.iteration_budget = IterationBudget(self.max_iterations)
 
-        # Log conversation turn start for debugging/observability
+        # 记录对话回合开始以便调试/可观察性
         _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
         _msg_preview = _msg_preview.replace("\n", " ")
         logger.info(
@@ -8780,29 +8777,29 @@ class AIAgent:
             _msg_preview,
         )
 
-        # Initialize conversation (copy to avoid mutating the caller's list)
+        # 初始化对话（复制以避免改变调用者的列表）
         messages = list(conversation_history) if conversation_history else []
 
-        # Hydrate todo store from conversation history (gateway creates a fresh
-        # AIAgent per message, so the in-memory store is empty -- we need to
-        # recover the todo state from the most recent todo tool response in history)
+        # 从对话历史中补充 todo 存储（网关为每条消息
+        # 创建一个新的 AIAgent，因此内存存储为空 — 我们需要
+        # 从历史记录中最近的 todo 工具响应恢复 todo 状态）
         if conversation_history and not self._todo_store.has_items():
             self._hydrate_todo_store(conversation_history)
         
-        # Prefill messages (few-shot priming) are injected at API-call time only,
-        # never stored in the messages list. This keeps them ephemeral: they won't
-        # be saved to session DB, session logs, or batch trajectories, but they're
-        # automatically re-applied on every API call (including session continuations).
+        # 预填充消息（少样本引导）仅在 API 调用时注入，
+        # 从不存储在消息列表中。这使它们保持临时：它们不会
+        # 被保存到会话 DB、会话日志或批处理轨迹，但它们
+        # 在每次 API 调用时自动重新应用（包括会话继续）。
         
-        # Track user turns for memory flush and periodic nudge logic
+        # 跟踪用户回合以进行内存刷新和定期提醒逻辑
         self._user_turn_count += 1
 
-        # Preserve the original user message (no nudge injection).
+        # 保留原始用户消息（无提醒注入）。
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-        # Track memory nudge trigger (turn-based, checked here).
-        # Skill trigger is checked AFTER the agent loop completes, based on
-        # how many tool iterations THIS turn used.
+        # 跟踪内存提醒触发器（基于回合，此处检查）。
+        # 技能触发器在代理循环完成后检查，基于
+        # 此回合使用的工具迭代次数。
         _should_review_memory = False
         if (self._memory_nudge_interval > 0
                 and "memory" in self.valid_tool_names
@@ -8821,17 +8818,18 @@ class AIAgent:
         if not self.quiet_mode:
             self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
         
-        # ── System prompt (cached per session for prefix caching) ──
-        # Built once on first call, reused for all subsequent calls.
-        # Only rebuilt after context compression events (which invalidate
-        # the cache and reload memory from disk).
+        # ── 系统提示（每个会话缓存以进行前缀缓存） ──
+        # 在第一次调用时构建一次，所有后续调用重用。
+        # 仅在上下文压缩事件后重建（这会
+        # 使缓存无效并从磁盘重新加载内存）。
         #
-        # For continuing sessions (gateway creates a fresh AIAgent per
-        # message), we load the stored system prompt from the session DB
-        # instead of rebuilding.  Rebuilding would pick up memory changes
-        # from disk that the model already knows about (it wrote them!),
-        # producing a different system prompt and breaking the Anthropic
-        # prefix cache.
+        # 对于继续会话（网关为每条
+        # 消息创建一个新的 AIAgent），我们从会话 DB
+        # 加载存储的系统提示
+        # 而不是重建。重建会拾取模型已经知道的
+        # 磁盘内存更改（它写入了它们！），
+        # 产生不同的系统提示并破坏 Anthropic
+        # 前缀缓存。
         if self._cached_system_prompt is None:
             stored_prompt = None
             if conversation_history and self._session_db:
@@ -8843,16 +8841,16 @@ class AIAgent:
                     pass  # Fall through to build fresh
 
             if stored_prompt:
-                # Continuing session — reuse the exact system prompt from
-                # the previous turn so the Anthropic cache prefix matches.
+                # 继续会话 — 重用上一回合的
+                # 完全相同的系统提示，以便 Anthropic 缓存前缀匹配。
                 self._cached_system_prompt = stored_prompt
             else:
-                # First turn of a new session — build from scratch.
+                # 新会话的第一回合 — 从头开始构建。
                 self._cached_system_prompt = self._build_system_prompt(system_message)
-                # Plugin hook: on_session_start
-                # Fired once when a brand-new session is created (not on
-                # continuation).  Plugins can use this to initialise
-                # session-scoped state (e.g. warm a memory cache).
+                # 插件钩子：on_session_start
+                # 在创建全新会话时触发一次（不是在
+                # 继续时）。插件可以使用此来初始化
+                # 会话范围状态（例如预热内存缓存）。
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook
                     _invoke_hook(
@@ -8864,7 +8862,7 @@ class AIAgent:
                 except Exception as exc:
                     logger.warning("on_session_start hook failed: %s", exc)
 
-                # Store the system prompt snapshot in SQLite
+                # 在 SQLite 中存储系统提示快照
                 if self._session_db:
                     try:
                         self._session_db.update_system_prompt(self.session_id, self._cached_system_prompt)
@@ -8873,20 +8871,20 @@ class AIAgent:
 
         active_system_prompt = self._cached_system_prompt
 
-        # ── Preflight context compression ──
-        # Before entering the main loop, check if the loaded conversation
-        # history already exceeds the model's context threshold.  This handles
-        # cases where a user switches to a model with a smaller context window
-        # while having a large existing session — compress proactively rather
-        # than waiting for an API error (which might be caught as a non-retryable
-        # 4xx and abort the request entirely).
+        # ── 预检上下文压缩 ──
+        # 在进入主循环之前，检查加载的对话
+        # 历史是否已经超过模型的上下文阈值。这处理
+        # 用户切换到具有较小上下文窗口的模型
+        # 同时拥有大型现有会话的情况 — 主动压缩
+        # 而不是等待 API 错误（可能被捕获为不可重试的
+        # 4xx 并完全中止请求）。
         if (
             self.compression_enabled
             and len(messages) > self.context_compressor.protect_first_n
                                 + self.context_compressor.protect_last_n + 1
         ):
-            # Include tool schema tokens — with many tools these can add
-            # 20-30K+ tokens that the old sys+msg estimate missed entirely.
+            # 包含工具模式令牌 — 对于许多工具，这些可以添加
+            # 20-30K+ 令牌，旧的 sys+msg 估计完全错过了。
             _preflight_tokens = estimate_request_tokens_rough(
                 messages,
                 system_prompt=active_system_prompt or "",
@@ -8906,8 +8904,9 @@ class AIAgent:
                         f"📦 Preflight compression: ~{_preflight_tokens:,} tokens "
                         f">= {self.context_compressor.threshold_tokens:,} threshold"
                     )
-                # May need multiple passes for very large sessions with small
-                # context windows (each pass summarises the middle N turns).
+                # 对于具有小
+                # 上下文窗口的非常大的会话，可能需要多次传递
+                # （每次传递总结中间 N 个回合）。
                 for _pass in range(3):
                     _orig_len = len(messages)
                     messages, active_system_prompt = self._compress_context(
@@ -8916,17 +8915,17 @@ class AIAgent:
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
-                    # Compression created a new session — clear the history
-                    # reference so _flush_messages_to_session_db writes ALL
-                    # compressed messages to the new session's SQLite, not
-                    # skipping them because conversation_history is still the
-                    # pre-compression length.
+                    # 压缩创建了新会话 — 清除历史
+                    # 引用，以便 _flush_messages_to_session_db 将所有
+                    # 压缩消息写入新会话的 SQLite，而不是
+                    # 因为 conversation_history 仍然是
+                    # 压缩前长度而跳过它们。
                     conversation_history = None
-                    # Fix: reset retry counters after compression so the model
-                    # gets a fresh budget on the compressed context.  Without
-                    # this, pre-compression retries carry over and the model
-                    # hits "(empty)" immediately after compression-induced
-                    # context loss.
+                    # 修复：压缩后重置重试计数器，以便模型
+                    # 在压缩上下文上获得新的预算。没有
+                    # 这个，压缩前重试会延续，模型
+                    # 在压缩导致的
+                    # 上下文丢失后立即遇到"(empty)"。
                     self._empty_content_retries = 0
                     self._thinking_prefill_retries = 0
                     self._last_content_with_tools = None
@@ -8941,18 +8940,18 @@ class AIAgent:
                     if _preflight_tokens < self.context_compressor.threshold_tokens:
                         break  # Under threshold
 
-        # Plugin hook: pre_llm_call
-        # Fired once per turn before the tool-calling loop.  Plugins can
-        # return a dict with a ``context`` key (or a plain string) whose
-        # value is appended to the current turn's user message.
+        # 插件钩子：pre_llm_call
+        # 在工具调用循环之前每回合触发一次。插件可以
+        # 返回带有 ``context`` 键（或纯字符串）的字典，其
+        # 值附加到当前回合的用户消息。
         #
-        # Context is ALWAYS injected into the user message, never the
-        # system prompt.  This preserves the prompt cache prefix — the
-        # system prompt stays identical across turns so cached tokens
-        # are reused.  The system prompt is Hermes's territory; plugins
-        # contribute context alongside the user's input.
+        # 上下文始终注入到用户消息中，从不注入到
+        # 系统提示中。这保留了提示缓存前缀 — 
+        # 系统提示在回合之间保持相同，因此缓存的令牌
+        # 被重用。系统提示是 Hermes 的领域；插件
+        # 与用户输入一起贡献上下文。
         #
-        # All injected context is ephemeral (not persisted to session DB).
+        # 所有注入的上下文都是临时的（不持久化到会话 DB）。
         _plugin_user_context = ""
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -8977,7 +8976,7 @@ class AIAgent:
         except Exception as exc:
             logger.warning("pre_llm_call hook failed: %s", exc)
 
-        # Main conversation loop
+        # 主对话循环
         api_call_count = 0
         final_response = None
         interrupted = False
@@ -8986,16 +8985,16 @@ class AIAgent:
         truncated_tool_call_retries = 0
         truncated_response_prefix = ""
         compression_attempts = 0
-        _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+        _turn_exit_reason = "unknown"  # 诊断：循环为何结束
         
-        # Record the execution thread so interrupt()/clear_interrupt() can
-        # scope the tool-level interrupt signal to THIS agent's thread only.
-        # Must be set before any thread-scoped interrupt syncing.
+        # 记录执行线程，以便 interrupt()/clear_interrupt() 可以
+        # 将工具级中断信号仅限定到此代理的线程。
+        # 必须在任何线程范围中断同步之前设置。
         self._execution_thread_id = threading.current_thread().ident
 
-        # Always clear stale per-thread state from a previous turn. If an
-        # interrupt arrived before startup finished, preserve it and bind it
-        # to this execution thread now instead of dropping it on the floor.
+        # 始终清除上一回合的陈旧每线程状态。如果
+        # 中断在启动完成之前到达，保留它并将其
+        # 现在绑定到此执行线程，而不是丢弃它。
         _set_interrupt(False, self._execution_thread_id)
         if self._interrupt_requested:
             _set_interrupt(True, self._execution_thread_id)
@@ -9004,9 +9003,9 @@ class AIAgent:
             self._interrupt_message = None
             self._interrupt_thread_signal_pending = False
 
-        # Notify memory providers of the new turn so cadence tracking works.
-        # Must happen BEFORE prefetch_all() so providers know which turn it is
-        # and can gate context/dialectic refresh via contextCadence/dialecticCadence.
+        # 通知内存提供商新回合，以便节奏跟踪工作。
+        # 必须在 prefetch_all() 之前发生，以便提供商知道这是哪一回合
+        # 并可以通过 contextCadence/dialecticCadence 控制上下文/辩证刷新。
         if self._memory_manager:
             try:
                 _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
@@ -9014,11 +9013,11 @@ class AIAgent:
             except Exception:
                 pass
 
-        # External memory provider: prefetch once before the tool loop.
-        # Reuse the cached result on every iteration to avoid re-calling
-        # prefetch_all() on each tool call (10 tool calls = 10x latency + cost).
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
+        # 外部内存提供商：在工具循环之前预取一次。
+        # 在每次迭代中重用缓存结果以避免在每次工具调用时
+        # 重新调用 prefetch_all()（10 个工具调用 = 10 倍延迟 + 成本）。
+        # 使用 original_user_message（干净输入）— user_message 可能包含
+        # 注入的技能内容，这些内容会膨胀/破坏提供商查询。
         _ext_prefetch_cache = ""
         if self._memory_manager:
             try:
@@ -9028,10 +9027,10 @@ class AIAgent:
                 pass
 
         while (api_call_count < self.max_iterations and self.iteration_budget.remaining > 0) or self._budget_grace_call:
-            # Reset per-turn checkpoint dedup so each iteration can take one snapshot
+            # 重置每回合检查点去重，以便每次迭代可以拍摄一个快照
             self._checkpoint_mgr.new_turn()
 
-            # Check for interrupt request (e.g., user sent new message)
+            # 检查中断请求（例如，用户发送新消息）
             if self._interrupt_requested:
                 interrupted = True
                 _turn_exit_reason = "interrupted_by_user"
@@ -9043,9 +9042,9 @@ class AIAgent:
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
 
-            # Grace call: the budget is exhausted but we gave the model one
-            # more chance.  Consume the grace flag so the loop exits after
-            # this iteration regardless of outcome.
+            # 宽限调用：预算已耗尽，但我们给了模型
+            # 另一次机会。消耗宽限标志，以便循环在此
+            # 迭代后退出，无论结果如何。
             if self._budget_grace_call:
                 self._budget_grace_call = False
             elif not self.iteration_budget.consume():
@@ -9054,7 +9053,7 @@ class AIAgent:
                     self._safe_print(f"\n⚠️  Iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} iterations used)")
                 break
 
-            # Fire step_callback for gateway hooks (agent:step event)
+            # 为网关钩子触发 step_callback（agent:step 事件）
             if self.step_callback is not None:
                 try:
                     prev_tools = []
@@ -9082,26 +9081,24 @@ class AIAgent:
                 except Exception as _step_err:
                     logger.debug("step_callback error (iteration %s): %s", api_call_count, _step_err)
 
-            # Track tool-calling iterations for skill nudge.
-            # Counter resets whenever skill_manage is actually used.
-            if (self._skill_nudge_interval > 0
-                    and "skill_manage" in self.valid_tool_names):
-                self._iters_since_skill += 1
+            # 跟踪技能提醒的工具调用迭代。
+            # 每当实际使用 skill_manage 时计数器重置。
+            self.skill_evolution.on_agent_iteration(self.valid_tool_names)
             
-            # Prepare messages for API call
-            # If we have an ephemeral system prompt, prepend it to the messages
-            # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
-            # However, providers like Moonshot AI require a separate 'reasoning_content' field
-            # on assistant messages with tool_calls. We handle both cases here.
+            # 为 API 调用准备消息
+            # 如果我们有临时系统提示，将其前置到消息
+            # 注意：推理通过 <think> 标签嵌入内容中以进行轨迹存储。
+            # 但是，像 Moonshot AI 这样的提供商需要在带有 tool_calls 的
+            # 助手消息上有单独的 'reasoning_content' 字段。我们在这里处理两种情况。
             api_messages = []
             for idx, msg in enumerate(messages):
                 api_msg = msg.copy()
 
-                # Inject ephemeral context into the current turn's user message.
-                # Sources: memory manager prefetch + plugin pre_llm_call hooks
-                # with target="user_message" (the default).  Both are
-                # API-call-time only — the original message in `messages` is
-                # never mutated, so nothing leaks into session persistence.
+                # 将临时上下文注入到当前回合的用户消息中。
+                # 来源：内存管理器预取 + 插件 pre_llm_call 钩子
+                # target="user_message"（默认）。两者都是
+                # 仅 API 调用时 — `messages` 中的原始消息
+                # 永远不会改变，因此没有任何内容泄漏到会话持久性中。
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
                     if _ext_prefetch_cache:
@@ -9115,73 +9112,74 @@ class AIAgent:
                         if isinstance(_base, str):
                             api_msg["content"] = _base + "\n\n" + "\n\n".join(_injections)
 
-                # For ALL assistant messages, pass reasoning back to the API
-                # This ensures multi-turn reasoning context is preserved
+                # 对于所有助手消息，将推理传回 API
+                # 这确保多回合推理上下文被保留
                 if msg.get("role") == "assistant":
                     reasoning_text = msg.get("reasoning")
                     if reasoning_text:
-                        # Add reasoning_content for API compatibility (Moonshot AI, Novita, OpenRouter)
+                        # 添加 reasoning_content 以实现 API 兼容性（Moonshot AI、Novita、OpenRouter）
                         api_msg["reasoning_content"] = reasoning_text
 
-                # Remove 'reasoning' field - it's for trajectory storage only
-                # We've copied it to 'reasoning_content' for the API above
+                # 删除 'reasoning' 字段 - 它仅用于轨迹存储
+                # 我们已将其复制到上面的 API 的 'reasoning_content'
                 if "reasoning" in api_msg:
                     api_msg.pop("reasoning")
-                # Remove finish_reason - not accepted by strict APIs (e.g. Mistral)
+                # 删除 finish_reason - 严格 API 不接受（例如 Mistral）
                 if "finish_reason" in api_msg:
                     api_msg.pop("finish_reason")
-                # Strip internal thinking-prefill marker
+                # 剥离内部思考预填充标记
                 api_msg.pop("_thinking_prefill", None)
-                # Strip Codex Responses API fields (call_id, response_item_id) for
-                # strict providers like Mistral, Fireworks, etc. that reject unknown fields.
-                # Uses new dicts so the internal messages list retains the fields
-                # for Codex Responses compatibility.
+                # 为严格的提供商（如 Mistral、Fireworks 等）剥离 Codex Responses API 字段（call_id、response_item_id），
+                # 这些提供商拒绝未知字段。
+                # 使用新字典，以便内部消息列表保留这些字段
+                # 以实现 Codex Responses 兼容性。
                 if self._should_sanitize_tool_calls():
                     self._sanitize_tool_calls_for_strict_api(api_msg)
-                # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
-                # The signature field helps maintain reasoning continuity
+                # 保留 'reasoning_details' - OpenRouter 将其用于多回合推理上下文
+                # 签名字段有助于维护推理连续性
                 api_messages.append(api_msg)
 
-            # Build the final system message: cached prompt + ephemeral system prompt.
-            # Ephemeral additions are API-call-time only (not persisted to session DB).
-            # External recall context is injected into the user message, not the system
-            # prompt, so the stable cache prefix remains unchanged.
+            # 构建最终系统消息：缓存提示 + 临时系统提示。
+            # 临时添加仅 API 调用时（不持久化到会话 DB）。
+            # 外部召回上下文注入到用户消息中，而不是系统
+            # 提示中，因此稳定的缓存前缀保持不变。
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
-            # NOTE: Plugin context from pre_llm_call hooks is injected into the
-            # user message (see injection block above), NOT the system prompt.
-            # This is intentional — system prompt modifications break the prompt
-            # cache prefix.  The system prompt is reserved for Hermes internals.
+            # 注意：来自 pre_llm_call 钩子的插件上下文注入到
+            # 用户消息中（见上面的注入块），而不是系统提示中。
+            # 这是故意的 — 系统提示修改会破坏提示
+            # 缓存前缀。系统提示保留给 Hermes 内部使用。
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
-            # Inject ephemeral prefill messages right after the system prompt
-            # but before conversation history. Same API-call-time-only pattern.
+            # 在系统提示之后但在对话历史之前注入临时预填充消息。
+            # 相同的仅 API 调时模式。
             if self.prefill_messages:
                 sys_offset = 1 if effective_system else 0
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
+            # 通过 OpenRouter 为 Claude 模型应用 Anthropic 提示缓存。
+            # 自动检测：如果模型名称包含 "claude" 且 base_url 是 OpenRouter，
+            # 注入 cache_control 断点（系统 + 最后 3 条消息）以在
+            # 多回合对话中减少约 75% 的输入令牌成本。
             if self._use_prompt_caching:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
 
-            # Safety net: strip orphaned tool results / add stubs for missing
-            # results before sending to the API.  Runs unconditionally — not
-            # gated on context_compressor — so orphans from session loading or
-            # manual message manipulation are always caught.
+            # 安全网：在发送到 API 之前剥离孤立工具结果 / 为缺失
+            # 结果添加存根。无条件运行 — 不
+            # 受 context_compressor 限制 — 因此会话加载或
+            # 手动消息操作的孤立内容总是被捕获。
             api_messages = self._sanitize_api_messages(api_messages)
 
-            # Normalize message whitespace and tool-call JSON for consistent
-            # prefix matching.  Ensures bit-perfect prefixes across turns,
-            # which enables KV cache reuse on local inference servers
-            # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-            # cloud providers.  Operates on api_messages (the API copy) so
-            # the original conversation history in `messages` is untouched.
+            # 标准化消息空白和工具调用 JSON 以实现一致的
+            # 前缀匹配。确保跨回合的位完美前缀，
+            # 这在本地推理服务器上启用 KV 缓存重用
+            # （llama.cpp、vLLM、Ollama）并提高
+            # 云提供商的缓存命中率。
+            # 在 api_messages（API 副本）上操作，因此
+            # `messages` 中的原始对话历史未被触及。
             for am in api_messages:
                 if isinstance(am.get("content"), str):
                     am["content"] = am["content"].strip()
@@ -9206,17 +9204,17 @@ class AIAgent:
                     new_tcs.append(tc)
                 am["tool_calls"] = new_tcs
 
-            # Proactively strip any surrogate characters before the API call.
-            # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
-            # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
-            # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
+            # 在 API 调用之前主动剥离任何代理项字符。
+            # 通过 Ollama 提供的模型（Kimi K2.5、GLM-5、Qwen）可以返回
+            # 单独的代理项（U+D800-U+DFFF），这些代理项会在 OpenAI SDK 内部
+            # 导致 json.dumps() 崩溃。此处清理可防止 3 次重试循环。
             _sanitize_messages_surrogates(api_messages)
 
-            # Calculate approximate request size for logging
+            # 计算请求的近似大小以供记录
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = estimate_messages_tokens_rough(api_messages)
             
-            # Thinking spinner for quiet mode (animated during API call)
+            # 安静模式的思考旋转器（在 API 调用期间动画）
             thinking_spinner = None
             
             if not self.quiet_mode:
@@ -9224,21 +9222,21 @@ class AIAgent:
                 self._vprint(f"{self.log_prefix}   📊 Request size: {len(api_messages)} messages, ~{approx_tokens:,} tokens (~{total_chars:,} chars)")
                 self._vprint(f"{self.log_prefix}   🔧 Available tools: {len(self.tools) if self.tools else 0}")
             else:
-                # Animated thinking spinner in quiet mode
+                # 安静模式下的动画思考旋转器
                 face = random.choice(KawaiiSpinner.get_thinking_faces())
                 verb = random.choice(KawaiiSpinner.get_thinking_verbs())
                 if self.thinking_callback:
-                    # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
-                    # (works in both streaming and non-streaming modes)
+                    # CLI TUI 模式：使用 prompt_toolkit 小部件而不是原始旋转器
+                    # （在流式和非流式模式下都有效）
                     self.thinking_callback(f"{face} {verb}...")
                 elif not self._has_stream_consumers() and self._should_start_quiet_spinner():
-                    # Raw KawaiiSpinner only when no streaming consumers and the
-                    # spinner output has a safe sink.
+                    # 仅在没有流式消费者且
+                    # 旋转器输出有安全接收器时使用原始 KawaiiSpinner。
                     spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
                     thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=self._print_fn)
                     thinking_spinner.start()
             
-            # Log request details if verbose
+            # 如果详细则记录请求详情
             if self.verbose_logging:
                 logging.debug(f"API Request - Model: {self.model}, Messages: {len(messages)}, Tools: {len(self.tools) if self.tools else 0}")
                 logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
@@ -9262,11 +9260,11 @@ class AIAgent:
             api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
-                # ── Nous Portal rate limit guard ──────────────────────
-                # If another session already recorded that Nous is rate-
-                # limited, skip the API call entirely.  Each attempt
-                # (including SDK-level retries) counts against RPH and
-                # deepens the rate limit hole.
+                # ── Nous Portal 速率限制保护 ──────────────────────
+                # 如果另一个会话已经记录了 Nous 被速率
+                # 限制，则完全跳过 API 调用。每次尝试
+                # （包括 SDK 级重试）都会计入 RPH 并
+                # 加深速率限制漏洞。
                 if self.provider == "nous":
                     try:
                         from agent.nous_rate_guard import (
@@ -9307,7 +9305,7 @@ class AIAgent:
                     except ImportError:
                         pass
                     except Exception:
-                        pass  # Never let rate guard break the agent loop
+                        pass  # 永不让速率保护破坏代理循环
 
                 try:
                     self._reset_stream_delivery_tracking()
@@ -9341,17 +9339,17 @@ class AIAgent:
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
 
-                    # Always prefer the streaming path — even without stream
-                    # consumers.  Streaming gives us fine-grained health
-                    # checking (90s stale-stream detection, 60s read timeout)
-                    # that the non-streaming path lacks.  Without this,
-                    # subagents and other quiet-mode callers can hang
-                    # indefinitely when the provider keeps the connection
-                    # alive with SSE pings but never delivers a response.
-                    # The streaming path is a no-op for callbacks when no
-                    # consumers are registered, and falls back to non-
-                    # streaming automatically if the provider doesn't
-                    # support it.
+                    # 始终首选流式路径 — 即使没有流
+                    # 消费者。流式传输为我们提供了细粒度的健康
+                    # 检查（90 秒陈旧流检测、60 秒读取超时），
+                    # 这是非流式路径所缺乏的。没有这个，
+                    # 子代理和其他安静模式调用者可能会无限期挂起，
+                    # 当提供商使用 SSE ping 保持连接活着
+                    # 但从不传递响应时。
+                    # 当没有
+                    # 消费者注册时，流式路径对回调是无操作的，
+                    # 如果提供商不支持，会自动回退到非
+                    # 流式。
                     def _stop_spinner():
                         nonlocal thinking_spinner
                         if thinking_spinner:
@@ -9361,15 +9359,16 @@ class AIAgent:
                             self.thinking_callback("")
 
                     _use_streaming = True
-                    # Provider signaled "stream not supported" on a previous
-                    # attempt — switch to non-streaming for the rest of this
-                    # session instead of re-failing every retry.
+                    # 提供商在之前的
+                    # 尝试中发出"不支持流式"信号 — 在此
+                    # 会话的其余时间切换到非流式，
+                    # 而不是每次重试都失败。
                     if getattr(self, "_disable_streaming", False):
                         _use_streaming = False
                     elif not self._has_stream_consumers():
-                        # No display/TTS consumer. Still prefer streaming for
-                        # health checking, but skip for Mock clients in tests
-                        # (mocks return SimpleNamespace, not stream iterators).
+                        # 没有显示/TTS 消费者。仍然首选流式进行
+                        # 健康检查，但跳过测试中的 Mock 客户端
+                        # （mock 返回 SimpleNamespace，而不是流迭代器）。
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
@@ -9383,8 +9382,8 @@ class AIAgent:
                     
                     api_duration = time.time() - api_start_time
                     
-                    # Stop thinking spinner silently -- the response box or tool
-                    # execution messages that follow are more informative.
+                    # 静默停止思考旋转器 — 后续的响应框或工具
+                    # 执行消息信息更丰富。
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
@@ -9395,11 +9394,11 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
                     
                     if self.verbose_logging:
-                        # Log response with provider info if available
+                        # 如果可用，记录带有提供商信息的响应
                         resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
                         logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
                     
-                    # Validate response shape before proceeding
+                    # 在继续之前验证响应形状
                     response_invalid = False
                     error_details = []
                     if self.api_mode == "codex_responses":
@@ -9411,10 +9410,9 @@ class AIAgent:
                             response_invalid = True
                             error_details.append("response.output is not a list")
                         elif not output_items:
-                            # Stream backfill may have failed, but
-                            # _normalize_codex_response can still recover
-                            # from response.output_text. Only mark invalid
-                            # when that fallback is also absent.
+                            # 流式回填可能已失败，但
+                            # _normalize_codex_response 仍可以从 response.output_text 恢复。
+                            # 仅当该回退也不存在时才标记为无效。
                             _out_text = getattr(response, "output_text", None)
                             _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
                             if _out_text_stripped:
@@ -9459,20 +9457,20 @@ class AIAgent:
                                 error_details.append("response.choices is empty")
 
                     if response_invalid:
-                        # Stop spinner before printing error messages
+                        # 在打印错误消息之前停止旋转器
                         if thinking_spinner:
                             thinking_spinner.stop("(´;ω;`) oops, retrying...")
                             thinking_spinner = None
                         if self.thinking_callback:
                             self.thinking_callback("")
                         
-                        # Invalid response — could be rate limiting, provider timeout,
-                        # upstream server error, or malformed response.
+                        # 无效响应 — 可能是速率限制、提供商超时、
+                        # 上游服务器错误或格式错误的响应。
                         retry_count += 1
                         
-                        # Eager fallback: empty/malformed responses are a common
-                        # rate-limit symptom.  Switch to fallback immediately
-                        # rather than retrying with extended backoff.
+                        # 主动回退：空/格式错误的响应是常见的
+                        # 速率限制症状。立即切换到回退
+                        # 而不是使用扩展退避重试。
                         if self._fallback_index < len(self._fallback_chain):
                             self._emit_status("⚠️ Empty/malformed response — switching to fallback...")
                         if self._try_activate_fallback():
@@ -9481,29 +9479,29 @@ class AIAgent:
                             primary_recovery_attempted = False
                             continue
 
-                        # Check for error field in response (some providers include this)
+                        # 检查响应中的错误字段（某些提供商包含此字段）
                         error_msg = "Unknown"
                         provider_name = "Unknown"
                         if response and hasattr(response, 'error') and response.error:
                             error_msg = str(response.error)
-                            # Try to extract provider from error metadata
+                            # 尝试从错误元数据中提取提供商
                             if hasattr(response.error, 'metadata') and response.error.metadata:
                                 provider_name = response.error.metadata.get('provider_name', 'Unknown')
                         elif response and hasattr(response, 'message') and response.message:
                             error_msg = str(response.message)
                         
-                        # Try to get provider from model field (OpenRouter often returns actual model used)
+                        # 尝试从模型字段获取提供商（OpenRouter 通常返回实际使用的模型）
                         if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
                             provider_name = f"model={response.model}"
                         
-                        # Check for x-openrouter-provider or similar metadata
+                        # 检查 x-openrouter-provider 或类似元数据
                         if provider_name == "Unknown" and response:
-                            # Log all response attributes for debugging
+                            # 记录所有响应属性以供调试
                             resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
                             if self.verbose_logging:
                                 logging.debug(f"Response attributes for invalid response: {resp_attrs}")
                         
-                        # Extract error code from response for contextual diagnostics
+                        # 从响应中提取错误代码以进行上下文诊断
                         _resp_error_code = None
                         if response and hasattr(response, 'error') and response.error:
                             _code_raw = getattr(response.error, 'code', None)
@@ -9515,8 +9513,9 @@ class AIAgent:
                                 except (TypeError, ValueError):
                                     pass
 
-                        # Build a human-readable failure hint from the error code
-                        # and response time, instead of always assuming rate limiting.
+                        # 从错误代码
+                        # 和响应时间构建人类可读的失败提示，
+                        # 而不是总是假设速率限制。
                         if _resp_error_code == 524:
                             _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
                         elif _resp_error_code == 504:
@@ -9543,7 +9542,7 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}   ⏱️  {_failure_hint}", force=True)
                         
                         if retry_count >= max_retries:
-                            # Try fallback before giving up
+                            # 在放弃之前尝试回退
                             self._emit_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                             if self._try_activate_fallback():
                                 retry_count = 0
@@ -9561,12 +9560,12 @@ class AIAgent:
                                 "failed": True  # Mark as failure for filtering
                             }
                         
-                        # Backoff before retry — jittered exponential: 5s base, 120s cap
+                        # 重试前退避 — 抖动指数：5 秒基数，120 秒上限
                         wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
-                        # Sleep in small increments to stay responsive to interrupts
+                        # 以小增量睡眠以保持对中断的响应
                         sleep_end = time.time() + wait_time
                         _backoff_touch_counter = 0
                         while time.time() < sleep_end:
@@ -9582,8 +9581,8 @@ class AIAgent:
                                     "interrupted": True,
                                 }
                             time.sleep(0.2)
-                            # Touch activity every ~30s so the gateway's inactivity
-                            # monitor knows we're alive during backoff waits.
+                            # 每 ~30 秒触摸一次活动，以便网关的非活动
+                            # 监视器知道我们在退避等待期间仍然活着。
                             _backoff_touch_counter += 1
                             if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                                 self._touch_activity(
@@ -9592,7 +9591,7 @@ class AIAgent:
                                 )
                         continue  # Retry the API call
 
-                    # Check finish_reason before proceeding
+                    # 在继续之前检查 finish_reason
                     if self.api_mode == "codex_responses":
                         status = getattr(response, "status", None)
                         incomplete_details = getattr(response, "incomplete_details", None)
@@ -9625,11 +9624,11 @@ class AIAgent:
                     if finish_reason == "length":
                         self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
 
-                        # ── Detect thinking-budget exhaustion ──────────────
-                        # When the model spends ALL output tokens on reasoning
-                        # and has none left for the response, continuation
-                        # retries are pointless.  Detect this early and give a
-                        # targeted error instead of wasting 3 API calls.
+                        # ── 检测思考预算耗尽 ──────────────
+                        # 当模型将所有输出令牌花费在推理上
+                        # 而没有剩余令牌用于响应时，继续
+                        # 重试是无意义的。早期检测并给出
+                        # 针对性错误，而不是浪费 3 次 API 调用。
                         _trunc_content = None
                         _trunc_has_tool_calls = False
                         if self.api_mode in ("chat_completions", "bedrock_converse"):
@@ -9637,20 +9636,21 @@ class AIAgent:
                             _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
                             _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
                         elif self.api_mode == "anthropic_messages":
-                            # Anthropic response.content is a list of blocks
+                            # Anthropic response.content 是一个块列表
                             _text_parts = []
                             for _blk in getattr(response, "content", []):
                                 if getattr(_blk, "type", None) == "text":
                                     _text_parts.append(getattr(_blk, "text", ""))
                             _trunc_content = "\n".join(_text_parts) if _text_parts else None
 
-                        # A response is "thinking exhausted" only when the model
-                        # actually produced reasoning blocks but no visible text after
-                        # them.  Models that do not use <think> tags (e.g. GLM-4.7 on
-                        # NVIDIA Build, minimax) may return content=None or an empty
-                        # string for unrelated reasons — treat those as normal
-                        # truncations that deserve continuation retries, not as
-                        # thinking-budget exhaustion.
+                        # 仅当模型
+                        # 实际产生推理块但在其后没有可见文本时，
+                        # 响应才是"思考耗尽"。
+                        # 不使用 <think> 标签的模型（例如 NVIDIA Build 上的 GLM-4.7、
+                        # minimax）可能因无关原因返回 content=None 或空
+                        # 字符串 — 将这些视为值得继续重试的
+                        # 正常截断，而不是
+                        # 思考预算耗尽。
                         _has_think_tags = bool(
                             _trunc_content and re.search(
                                 r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>',
@@ -9678,9 +9678,9 @@ class AIAgent:
                                 f"no visible response was produced.",
                                 force=True,
                             )
-                            # Return a user-friendly message as the response so
-                            # CLI (response box) and gateway (chat message) both
-                            # display it naturally instead of a suppressed error.
+                            # 作为响应返回用户友好的消息，以便
+                            # CLI（响应框）和网关（聊天消息）都
+                            # 自然地显示它，而不是被抑制的错误。
                             _exhaust_response = (
                                 "⚠️ **Thinking Budget Exhausted**\n\n"
                                 "The model used all its output tokens on reasoning "
@@ -9749,9 +9749,9 @@ class AIAgent:
                                         f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
                                         force=True,
                                     )
-                                    # Don't append the broken response to messages;
-                                    # just re-run the same API call from the current
-                                    # message state, giving the model another chance.
+                                    # 不要将损坏的响应附加到消息；
+                                    # 只是从当前
+                                    # 消息状态重新运行相同的 API 调用，给模型另一次机会。
                                     continue
                                 self._vprint(
                                     f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
@@ -9768,7 +9768,7 @@ class AIAgent:
                                     "error": "Response truncated due to output length limit",
                                 }
 
-                        # If we have prior messages, roll back to last complete state
+                        # 如果我们有先前的消息，回滚到最后一个完整状态
                         if len(messages) > 1:
                             self._vprint(f"{self.log_prefix}   ⏪ Rolling back to last complete assistant turn")
                             rolled_back_messages = self._get_messages_up_to_last_assistant(messages)
@@ -9785,7 +9785,7 @@ class AIAgent:
                                 "error": "Response truncated due to output length limit"
                             }
                         else:
-                            # First message was truncated - mark as failed
+                            # 第一条消息被截断 - 标记为失败
                             self._vprint(f"{self.log_prefix}❌ First response truncated - cannot recover", force=True)
                             self._persist_session(messages, conversation_history)
                             return {
@@ -9797,7 +9797,7 @@ class AIAgent:
                                 "error": "First response truncated due to output length limit"
                             }
                     
-                    # Track actual token usage from response for context management
+                    # 跟踪响应中的实际令牌使用量以进行上下文管理
                     if hasattr(response, 'usage') and response.usage:
                         canonical_usage = normalize_usage(
                             response.usage,
@@ -9814,9 +9814,9 @@ class AIAgent:
                         }
                         self.context_compressor.update_from_response(usage_dict)
 
-                        # Cache discovered context length after successful call.
-                        # Only persist limits confirmed by the provider (parsed
-                        # from the error message), not guessed probe tiers.
+                        # 成功调用后缓存发现的上下文长度。
+                        # 仅持久化提供商确认的限制（从
+                        # 错误消息解析），而不是猜测的探测层级。
                         if getattr(self.context_compressor, "_context_probed", False):
                             ctx = self.context_compressor.context_length
                             if getattr(self.context_compressor, "_context_probe_persistable", False):
@@ -9835,7 +9835,7 @@ class AIAgent:
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
-                        # Log API call details for debugging/observability
+                        # 记录 API 调用详情以供调试/可观察性
                         _cache_pct = ""
                         if canonical_usage.cache_read_tokens and prompt_tokens:
                             _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
@@ -9858,13 +9858,13 @@ class AIAgent:
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
 
-                        # Persist token counts to session DB for /insights.
-                        # Do this for every platform with a session_id so non-CLI
-                        # sessions (gateway, cron, delegated runs) cannot lose
-                        # token/accounting data if a higher-level persistence path
-                        # is skipped or fails. Gateway/session-store writes use
-                        # absolute totals, so they safely overwrite these per-call
-                        # deltas instead of double-counting them.
+                        # 将令牌计数持久化到会话 DB 以供 /insights 使用。
+                        # 对每个具有 session_id 的平台执行此操作，以便非 CLI
+                        # 会话（网关、cron、委托运行）不会丢失
+                        # 令牌/计费数据，如果更高级别的持久化路径
+                        # 被跳过或失败。网关/会话存储写入使用
+                        # 绝对总数，因此它们安全地覆盖这些每次调用
+                        # 增量，而不是重复计算它们。
                         if self._session_db and self.session_id:
                             try:
                                 self._session_db.update_token_counts(
@@ -9885,19 +9885,19 @@ class AIAgent:
                                     model=self.model,
                                 )
                             except Exception:
-                                pass  # never block the agent loop
+                                pass  # 永不阻止代理循环
                         
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
-                        # Log cache hit stats when prompt caching is active
+                        # 当提示缓存处于活动状态时记录缓存命中统计
                         if self._use_prompt_caching:
                             if self.api_mode == "anthropic_messages":
-                                # Anthropic uses cache_read_input_tokens / cache_creation_input_tokens
+                                # Anthropic 使用 cache_read_input_tokens / cache_creation_input_tokens
                                 cached = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
                                 written = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
                             else:
-                                # OpenRouter uses prompt_tokens_details.cached_tokens
+                                # OpenRouter 使用 prompt_tokens_details.cached_tokens
                                 details = getattr(response.usage, 'prompt_tokens_details', None)
                                 cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
                                 written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
@@ -9906,10 +9906,10 @@ class AIAgent:
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
-                    has_retried_429 = False  # Reset on success
-                    # Clear Nous rate limit state on successful request —
-                    # proves the limit has reset and other sessions can
-                    # resume hitting Nous.
+                    has_retried_429 = False  # 成功时重置
+                    # 在成功请求时清除 Nous 速率限制状态 —
+                    # 证明限制已重置，其他会话可以
+                    # 继续访问 Nous。
                     if self.provider == "nous":
                         try:
                             from agent.nous_rate_guard import clear_nous_rate_limit
@@ -9941,34 +9941,32 @@ class AIAgent:
                         self.thinking_callback("")
 
                     # -----------------------------------------------------------
-                    # UnicodeEncodeError recovery.  Two common causes:
-                    #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste
-                    #      (Google Docs, rich-text editors) — sanitize and retry.
-                    #   2. ASCII codec on systems with LANG=C or non-UTF-8 locale
-                    #      (e.g. Chromebooks) — any non-ASCII character fails.
-                    #      Detect via the error message mentioning 'ascii' codec.
-                    # We sanitize messages in-place and may retry twice:
-                    # first to strip surrogates, then once more for pure
-                    # ASCII-only locale sanitization if needed.
+                    # UnicodeEncodeError 恢复。两个常见原因：
+                    #   1. 来自剪贴板粘贴的单独代理项（U+D800..U+DFFF）
+                    #      （Google Docs、富文本编辑器）— 清理并重试。
+                    #   2. 具有 LANG=C 或非 UTF-8 语言环境的系统上的 ASCII 编解码器
+                    #      （例如 Chromebooks）— 任何非 ASCII 字符都会失败。
+                    #      通过提及 'ascii' 编解码器的错误消息检测。
+                    # 我们就地清理消息并可能重试两次：
+                    # 首先剥离代理项，然后如果需要再进行一次纯
+                    # ASCII 仅语言环境清理。
                     # -----------------------------------------------------------
                     if isinstance(api_error, UnicodeEncodeError) and getattr(self, '_unicode_sanitization_passes', 0) < 2:
                         _err_str = str(api_error).lower()
                         _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
-                        # Detect surrogate errors — utf-8 codec refusing to
-                        # encode U+D800..U+DFFF.  The error text is:
+                        # 检测代理项错误 — utf-8 编解码器拒绝
+                        # 编码 U+D800..U+DFFF。错误文本是：
                         #   "'utf-8' codec can't encode characters in position
                         #    N-M: surrogates not allowed"
                         _is_surrogate_error = (
                             "surrogate" in _err_str
                             or ("'utf-8'" in _err_str and not _is_ascii_codec)
                         )
-                        # Sanitize surrogates from both the canonical `messages`
-                        # list AND `api_messages` (the API-copy, which may carry
-                        # `reasoning_content`/`reasoning_details` transformed
-                        # from `reasoning` — fields the canonical list doesn't
-                        # have directly).  Also clean `api_kwargs` if built and
-                        # `prefill_messages` if present.  Mirrors the ASCII
-                        # codec recovery below.
+                        # 从规范 `messages` 列表和 `api_messages`（API 副本，可能携带
+                        # 从 `reasoning` 转换的 `reasoning_content`/`reasoning_details` — 
+                        # 规范列表没有的字段）中清理代理项。
+                        # 如果已构建也清理 `api_kwargs`，如果存在也清理 `prefill_messages`。
+                        # 镜像下面的 ASCII 编解码器恢复。
                         _surrogates_found = _sanitize_messages_surrogates(messages)
                         if isinstance(api_messages, list):
                             if _sanitize_messages_surrogates(api_messages):
@@ -9979,14 +9977,14 @@ class AIAgent:
                         if isinstance(getattr(self, "prefill_messages", None), list):
                             if _sanitize_messages_surrogates(self.prefill_messages):
                                 _surrogates_found = True
-                        # Gate the retry on the error type, not on whether we
-                        # found anything — _force_ascii_payload / the extended
-                        # surrogate walker above cover all known paths, but a
-                        # new transformed field could still slip through.  If
-                        # the error was a surrogate encode failure, always let
-                        # the retry run; the proactive sanitizer at line ~8781
-                        # runs again on the next iteration.  Bounded by
-                        # _unicode_sanitization_passes < 2 (outer guard).
+                        # 根据错误类型而不是我们是否
+                        # 找到任何内容来决定重试 — _force_ascii_payload / 上面的扩展
+                        # 代理项遍历器覆盖所有已知路径，但
+                        # 新的转换字段仍可能漏过。如果
+                        # 错误是代理项编码失败，始终让
+                        # 重试运行；第 ~8781 行的主动清理器
+                        # 在下一次迭代时再次运行。受
+                        # _unicode_sanitization_passes < 2（外部保护）限制。
                         if _surrogates_found or _is_surrogate_error:
                             self._unicode_sanitization_passes += 1
                             if _surrogates_found:
@@ -10002,20 +10000,20 @@ class AIAgent:
                             continue
                         if _is_ascii_codec:
                             self._force_ascii_payload = True
-                            # ASCII codec: the system encoding can't handle
-                            # non-ASCII characters at all. Sanitize all
-                            # non-ASCII content from messages/tool schemas and retry.
-                            # Sanitize both the canonical `messages` list and
-                            # `api_messages` (the API-copy built before the retry
-                            # loop, which may contain extra fields like
-                            # reasoning_content that are not in `messages`).
+                            # ASCII 编解码器：系统编码根本无法处理
+                            # 非 ASCII 字符。清理所有
+                            # 来自消息/工具模式的非 ASCII 内容并重试。
+                            # 清理规范 `messages` 列表和
+                            # `api_messages`（在重试循环之前构建的 API 副本，
+                            # 可能包含不在 `messages` 中的额外字段，
+                            # 如 reasoning_content）。
                             _messages_sanitized = _sanitize_messages_non_ascii(messages)
                             if isinstance(api_messages, list):
                                 _sanitize_messages_non_ascii(api_messages)
-                            # Also sanitize the last api_kwargs if already built,
-                            # so a leftover non-ASCII value in a transformed field
-                            # (e.g. extra_body, reasoning_content) doesn't survive
-                            # into the next attempt via _build_api_kwargs cache paths.
+                            # 如果已经构建也清理最后的 api_kwargs，
+                            # 以便转换字段中的剩余非 ASCII 值
+                            # （例如 extra_body、reasoning_content）不会通过
+                            # _build_api_kwargs 缓存路径存活到下一次尝试。
                             if isinstance(api_kwargs, dict):
                                 _sanitize_structure_non_ascii(api_kwargs)
                             _prefill_sanitized = False
@@ -10048,12 +10046,12 @@ class AIAgent:
                             if isinstance(_default_headers, dict):
                                 _headers_sanitized = _sanitize_structure_non_ascii(_default_headers)
 
-                            # Sanitize the API key — non-ASCII characters in
-                            # credentials (e.g. ʋ instead of v from a bad
-                            # copy-paste) cause httpx to fail when encoding
-                            # the Authorization header as ASCII.  This is the
-                            # most common cause of persistent UnicodeEncodeError
-                            # that survives message/tool sanitization (#6843).
+                            # 清理 API 密钥 — 凭据中的非 ASCII 字符
+                            # （例如，来自错误复制粘贴的 ʋ 而不是 v）
+                            # 会导致 httpx 在将
+                            # Authorization 标头编码为 ASCII 时失败。这是
+                            # 持续 UnicodeEncodeError 的最常见原因，
+                            # 这种错误在消息/工具清理后仍然存在（#6843）。
                             _credential_sanitized = False
                             _raw_key = getattr(self, "api_key", None) or ""
                             if _raw_key:
@@ -10062,9 +10060,9 @@ class AIAgent:
                                     self.api_key = _clean_key
                                     if isinstance(getattr(self, "_client_kwargs", None), dict):
                                         self._client_kwargs["api_key"] = _clean_key
-                                    # Also update the live client — it holds its
-                                    # own copy of api_key which auth_headers reads
-                                    # dynamically on every request.
+                                    # 同时更新实时客户端 — 它持有
+                                    # api_key 的自己的副本，auth_headers 在
+                                    # 每个请求上动态读取。
                                     if getattr(self, "client", None) is not None and hasattr(self.client, "api_key"):
                                         self.client.api_key = _clean_key
                                     _credential_sanitized = True
@@ -10075,14 +10073,14 @@ class AIAgent:
                                         force=True,
                                     )
 
-                            # Always retry on ASCII codec detection —
-                            # _force_ascii_payload guarantees the full
-                            # api_kwargs payload is sanitized on the
-                            # next iteration (line ~8475).  Even when
-                            # per-component checks above find nothing
-                            # (e.g. non-ASCII only in api_messages'
-                            # reasoning_content), the flag catches it.
-                            # Bounded by _unicode_sanitization_passes < 2.
+                            # 在检测到 ASCII 编解码器时始终重试 —
+                            # _force_ascii_payload 保证完整的
+                            # api_kwargs 有效负载在下一次迭代（第 ~8475 行）被清理。
+                            # 即使上面的
+                            # 每个组件检查没有发现任何内容
+                            # （例如，非 ASCII 仅在 api_messages 的
+                            # reasoning_content 中），该标志也会捕获它。
+                            # 受 _unicode_sanitization_passes < 2 限制。
                             self._unicode_sanitization_passes += 1
                             _any_sanitized = (
                                 _messages_sanitized
@@ -10107,7 +10105,7 @@ class AIAgent:
                     status_code = getattr(api_error, "status_code", None)
                     error_context = self._extract_api_error_context(api_error)
 
-                    # ── Classify the error for structured recovery decisions ──
+                    # ── 对错误进行分类以进行结构化恢复决策 ──
                     _compressor = getattr(self, "context_compressor", None)
                     _ctx_len = getattr(_compressor, "context_length", 200000) if _compressor else 200000
                     classified = classify_api_error(
@@ -10164,7 +10162,7 @@ class AIAgent:
                         if self._try_refresh_anthropic_client_credentials():
                             print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
                             continue
-                        # Credential refresh didn't help — show diagnostic info
+                        # 凭据刷新没有帮助 — 显示诊断信息
                         key = self._anthropic_api_key
                         auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
                         print(f"{self.log_prefix}🔐 Anthropic 401 — authentication failed.")
@@ -10176,17 +10174,17 @@ class AIAgent:
                         print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
                         print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
                         print(f"{self.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
-                        print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
+                        print(f"{self.log_prefix}     • 对于 Claude Code：运行 'claude /login' 刷新，然后重试")
                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
-                    # ── Thinking block signature recovery ─────────────────
-                    # Anthropic signs thinking blocks against the full turn
-                    # content.  Any upstream mutation (context compression,
-                    # session truncation, message merging) invalidates the
-                    # signature → HTTP 400.  Recovery: strip reasoning_details
-                    # from all messages so the next retry sends no thinking
-                    # blocks at all.  One-shot — don't retry infinitely.
+                    # ── 思考块签名恢复 ─────────────────
+                    # Anthropic 对完整回合
+                    # 内容签名思考块。任何上游突变（上下文压缩、
+                    # 会话截断、消息合并）都会使
+                    # 签名无效 → HTTP 400。恢复：从所有消息中剥离 reasoning_details
+                    # 以便下一次重试根本不发送思考
+                    # 块。一次性 — 不要无限重试。
                     if (
                         classified.reason == FailoverReason.thinking_signature
                         and not thinking_sig_retry_attempted
@@ -10240,10 +10238,10 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}   📋 Details: {_err_body_str}", force=True)
                     self._vprint(f"{self.log_prefix}   ⏱️  Elapsed: {elapsed_time:.2f}s  Context: {len(api_messages)} msgs, ~{approx_tokens:,} tokens")
 
-                    # Actionable hint for OpenRouter "no tool endpoints" error.
-                    # This fires regardless of whether fallback succeeds — the
-                    # user needs to know WHY their model failed so they can fix
-                    # their provider routing, not just silently fall back.
+                    # OpenRouter "no tool endpoints" 错误的可操作提示。
+                    # 无论回退是否成功都会触发 — 
+                    # 用户需要知道他们的模型为什么失败，以便他们可以修复
+                    # 他们的提供商路由，而不是仅仅静默回退。
                     if (
                         self._is_openrouter_url()
                         and "support tool use" in error_msg
@@ -10266,7 +10264,7 @@ class AIAgent:
                             force=True,
                         )
 
-                    # Check for interrupt before deciding to retry
+                    # 在决定重试之前检查中断
                     if self._interrupt_requested:
                         self._vprint(f"{self.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                         self._persist_session(messages, conversation_history)
@@ -10279,18 +10277,18 @@ class AIAgent:
                             "interrupted": True,
                         }
                     
-                    # Check for 413 payload-too-large BEFORE generic 4xx handler.
-                    # A 413 is a payload-size error — the correct response is to
-                    # compress history and retry, not abort immediately.
+                    # 在通用 4xx 处理程序之前检查 413 payload-too-large。
+                    # 413 是有效负载大小错误 — 正确的响应是
+                    # 压缩历史记录并重试，而不是立即中止。
                     status_code = getattr(api_error, "status_code", None)
 
-                    # ── Anthropic Sonnet long-context tier gate ───────────
-                    # Anthropic returns HTTP 429 "Extra usage is required for
-                    # long context requests" when a Claude Max (or similar)
-                    # subscription doesn't include the 1M-context tier.  This
-                    # is NOT a transient rate limit — retrying or switching
-                    # credentials won't help.  Reduce context to 200k (the
-                    # standard tier) and compress.
+                    # ── Anthropic Sonnet 长上下文层级门 ───────────
+                    # 当 Claude Max（或类似）
+                    # 订阅不包含 1M 上下文层级时，Anthropic 返回 HTTP 429 "Extra usage is required for
+                    # long context requests"。这
+                    # 不是瞬态速率限制 — 重试或切换
+                    # 凭据不会有帮助。将上下文减少到 200k（
+                    # 标准层级）并压缩。
                     if classified.reason == FailoverReason.long_context_tier:
                         _reduced_ctx = 200000
                         compressor = self.context_compressor
@@ -10307,10 +10305,10 @@ class AIAgent:
                             # compressor (plugin engines manage their own).
                             if hasattr(compressor, "_context_probed"):
                                 compressor._context_probed = True
-                                # Don't persist — this is a subscription-tier
-                                # limitation, not a model capability.  If the
-                                # user later enables extra usage the 1M limit
-                                # should come back automatically.
+                                # 不要持久化 — 这是订阅层级
+                                # 限制，而不是模型能力。如果
+                                # 用户稍后启用额外使用，1M 限制
+                                # 应该自动恢复。
                                 compressor._context_probe_persistable = False
                             self._vprint(
                                 f"{self.log_prefix}⚠️  Anthropic long-context tier "
@@ -10327,9 +10325,9 @@ class AIAgent:
                                 approx_tokens=approx_tokens,
                                 task_id=effective_task_id,
                             )
-                            # Compression created a new session — clear history
-                            # so _flush_messages_to_session_db writes compressed
-                            # messages to the new session, not skipping them.
+                            # 压缩创建了新会话 — 清除历史
+                            # 以便 _flush_messages_to_session_db 将压缩的
+                            # 消息写入新会话，而不是跳过它们。
                             conversation_history = None
                             if len(messages) < original_len or old_ctx > _reduced_ctx:
                                 self._emit_status(
@@ -10339,22 +10337,22 @@ class AIAgent:
                                 time.sleep(2)
                                 restart_with_compressed_messages = True
                                 break
-                        # Fall through to normal error handling if compression
-                        # is exhausted or didn't help.
+                        # 如果压缩
+                        # 耗尽或没有帮助，则进入正常错误处理。
 
-                    # Eager fallback for rate-limit errors (429 or quota exhaustion).
-                    # When a fallback model is configured, switch immediately instead
-                    # of burning through retries with exponential backoff -- the
-                    # primary provider won't recover within the retry window.
+                    # 速率限制错误（429 或配额耗尽）的主动回退。
+                    # 当配置了回退模型时，立即切换而不是
+                    # 通过指数退避消耗重试 — 
+                    # 主要提供商不会在重试窗口内恢复。
                     is_rate_limited = classified.reason in (
                         FailoverReason.rate_limit,
                         FailoverReason.billing,
                     )
                     if is_rate_limited and self._fallback_index < len(self._fallback_chain):
-                        # Don't eagerly fallback if credential pool rotation may
-                        # still recover.  The pool's retry-then-rotate cycle needs
-                        # at least one more attempt to fire — jumping to a fallback
-                        # provider here short-circuits it.
+                        # 如果凭据池轮换可能
+                        # 仍然恢复，则不要主动回退。池的重试然后轮换周期
+                        # 至少需要再尝试一次才能触发 — 在这里跳转到回退
+                        # 提供商会短路它。
                         pool = self._credential_pool
                         pool_may_recover = pool is not None and pool.has_available()
                         if not pool_may_recover:
@@ -10365,14 +10363,14 @@ class AIAgent:
                                 primary_recovery_attempted = False
                                 continue
 
-                    # ── Nous Portal: record rate limit & skip retries ─────
-                    # When Nous returns a 429, record the reset time to a
-                    # shared file so ALL sessions (cron, gateway, auxiliary)
-                    # know not to pile on.  Then skip further retries —
-                    # each one burns another RPH request and deepens the
-                    # rate limit hole.  The retry loop's top-of-iteration
-                    # guard will catch this on the next pass and try
-                    # fallback or bail with a clear message.
+                    # ── Nous Portal：记录速率限制并跳过重试 ─────
+                    # 当 Nous 返回 429 时，将重置时间记录到
+                    # 共享文件，以便所有会话（cron、网关、辅助）
+                    # 知道不要堆积。然后跳过进一步的重试 —
+                    # 每一个都会消耗另一个 RPH 请求并加深
+                    # 速率限制漏洞。重试循环的迭代顶部
+                    # 守护将在下一次传递时捕获此情况并尝试
+                    # 回退或以明确消息退出。
                     if (
                         is_rate_limited
                         and self.provider == "nous"
@@ -10392,8 +10390,8 @@ class AIAgent:
                             )
                         except Exception:
                             pass
-                        # Skip straight to max_retries — the top-of-loop
-                        # guard will handle fallback or bail cleanly.
+                        # 直接跳到 max_retries — 循环顶部
+                        # 守护将处理回退或干净退出。
                         retry_count = max_retries
                         continue
 
@@ -10449,10 +10447,10 @@ class AIAgent:
                                 "compression_exhausted": True,
                             }
 
-                    # Check for context-length errors BEFORE generic 4xx handler.
-                    # The classifier detects context overflow from: explicit error
-                    # messages, generic 400 + large session heuristic (#1630), and
-                    # server disconnect + large session pattern (#2153).
+                    # 在通用 4xx 处理程序之前检查上下文长度错误。
+                    # 分类器从以下情况检测上下文溢出：明确错误
+                    # 消息、通用 400 + 大会话启发式（#1630）和
+                    # 服务器断开连接 + 大会话模式（#2153）。
                     is_context_length_error = (
                         classified.reason == FailoverReason.context_overflow
                     )
@@ -10461,22 +10459,22 @@ class AIAgent:
                         compressor = self.context_compressor
                         old_ctx = compressor.context_length
 
-                        # ── Distinguish two very different errors ───────────
-                        # 1. "Prompt too long": the INPUT exceeds the context window.
-                        #    Fix: reduce context_length + compress history.
-                        # 2. "max_tokens too large": input is fine, but
-                        #    input_tokens + requested max_tokens > context_window.
-                        #    Fix: reduce max_tokens (the OUTPUT cap) for this call.
-                        #    Do NOT shrink context_length — the window is unchanged.
+                        # ── 区分两种非常不同的错误 ───────────
+                        # 1. "Prompt too long"：输入超过上下文窗口。
+                        #    修复：减少 context_length + 压缩历史。
+                        # 2. "max_tokens too large"：输入正常，但
+                        #    input_tokens + 请求的 max_tokens > context_window。
+                        #    修复：为此调用减少 max_tokens（输出上限）。
+                        #    不要缩小 context_length — 窗口未更改。
                         #
-                        # Note: max_tokens = output token cap (one response).
-                        #       context_length = total window (input + output combined).
+                        # 注意：max_tokens = 输出令牌上限（一个响应）。
+                        #       context_length = 总窗口（输入 + 输出组合）。
                         available_out = parse_available_output_tokens_from_error(error_msg)
                         if available_out is not None:
-                            # Error is purely about the output cap being too large.
-                            # Cap output to the available space and retry without
-                            # touching context_length or triggering compression.
-                            safe_out = max(1, available_out - 64)  # small safety margin
+                            # 错误纯粹是输出上限太大。
+                            # 将输出限制到可用空间并重试，而不
+                            # 触摸 context_length 或触发压缩。
+                            safe_out = max(1, available_out - 64)  # 小安全边距
                             self._ephemeral_max_output_tokens = safe_out
                             self._vprint(
                                 f"{self.log_prefix}⚠️  Output cap too large for current prompt — "
@@ -10484,8 +10482,8 @@ class AIAgent:
                                 f"(available_tokens={available_out:,}; context_length unchanged at {old_ctx:,})",
                                 force=True,
                             )
-                            # Still count against compression_attempts so we don't
-                            # loop forever if the error keeps recurring.
+                            # 仍然计入 compression_attempts，这样如果
+                            # 错误持续发生，我们不会无限循环。
                             compression_attempts += 1
                             if compression_attempts > max_compression_attempts:
                                 self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
@@ -10504,14 +10502,14 @@ class AIAgent:
                             restart_with_compressed_messages = True
                             break
 
-                        # Error is about the INPUT being too large — reduce context_length.
-                        # Try to parse the actual limit from the error message
+                        # 错误是关于输入太大 — 减少 context_length。
+                        # 尝试从错误消息解析实际限制
                         parsed_limit = parse_context_limit_from_error(error_msg)
                         if parsed_limit and parsed_limit < old_ctx:
                             new_ctx = parsed_limit
                             self._vprint(f"{self.log_prefix}⚠️  Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})", force=True)
                         else:
-                            # Step down to the next probe tier
+                            # 降到下一个探测层级
                             new_ctx = get_next_probe_tier(old_ctx)
 
                         if new_ctx and new_ctx < old_ctx:
@@ -10526,11 +10524,10 @@ class AIAgent:
                             # compressor (plugin engines manage their own).
                             if hasattr(compressor, "_context_probed"):
                                 compressor._context_probed = True
-                                # Only persist limits parsed from the provider's
-                                # error message (a real number).  Guessed fallback
-                                # tiers from get_next_probe_tier() should stay
-                                # in-memory only — persisting them pollutes the
-                                # cache with wrong values.
+                                # 仅持久化从提供商的
+                                # 错误消息解析的限制（实数）。来自 get_next_probe_tier() 的猜测回退
+                                # 层级应仅保留在内存中 — 持久化它们会
+                                # 用错误的值污染缓存。
                                 compressor._context_probe_persistable = bool(
                                     parsed_limit and parsed_limit == new_ctx
                                 )
@@ -10572,7 +10569,7 @@ class AIAgent:
                             restart_with_compressed_messages = True
                             break
                         else:
-                            # Can't compress further and already at minimum tier
+                            # 无法进一步压缩且已处于最低层级
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
@@ -10587,10 +10584,10 @@ class AIAgent:
                                 "compression_exhausted": True,
                             }
 
-                    # Check for non-retryable client errors.  The classifier
-                    # already accounts for 413, 429, 529 (transient), context
-                    # overflow, and generic-400 heuristics.  Local validation
-                    # errors (ValueError, TypeError) are programming bugs.
+                    # 检查不可重试的客户端错误。分类器
+                    # 已经考虑了 413、429、529（瞬态）、上下文
+                    # 溢出和通用 400 启发式。本地验证
+                    # 错误（ValueError、TypeError）是编程错误。
                     is_local_validation_error = (
                         isinstance(api_error, (ValueError, TypeError))
                         and not isinstance(api_error, UnicodeEncodeError)
@@ -10613,8 +10610,8 @@ class AIAgent:
                     ) and not is_context_length_error
 
                     if is_client_error:
-                        # Try fallback before aborting — a different provider
-                        # may not have the same issue (rate limit, auth, etc.)
+                        # 在中止之前尝试回退 — 不同的提供商
+                        # 可能没有相同的问题（速率限制、身份验证等）
                         self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                         if self._try_activate_fallback():
                             retry_count = 0
@@ -10632,7 +10629,7 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                         self._vprint(f"{self.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                         self._vprint(f"{self.log_prefix}   🌐 Endpoint: {_base}", force=True)
-                        # Actionable guidance for common auth errors
+                        # 常见身份验证错误的可操作指导
                         if classified.is_auth or classified.reason == FailoverReason.billing:
                             if _provider == "openai-codex" and status_code == 401:
                                 self._vprint(f"{self.log_prefix}   💡 Codex OAuth token was rejected (HTTP 401). Your token may have been", force=True)
@@ -10648,11 +10645,11 @@ class AIAgent:
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
-                        # Skip session persistence when the error is likely
-                        # context-overflow related (status 400 + large session).
-                        # Persisting the failed user message would make the
-                        # session even larger, causing the same failure on the
-                        # next attempt. (#1630)
+                        # 当错误可能
+                        # 与上下文溢出相关时跳过会话持久化（状态 400 + 大会话）。
+                        # 持久化失败的用户消息会使
+                        # 会话更大，导致下一次
+                        # 尝试出现相同的失败。（#1630）
                         if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                             self._vprint(
                                 f"{self.log_prefix}⚠️  Skipping session persistence "
@@ -10671,17 +10668,17 @@ class AIAgent:
                         }
 
                     if retry_count >= max_retries:
-                        # Before falling back, try rebuilding the primary
-                        # client once for transient transport errors (stale
-                        # connection pool, TCP reset).  Only attempted once
-                        # per API call block.
+                        # 在回退之前，尝试为主要
+                        # 客户端重建一次，以处理瞬态传输错误（陈旧
+                        # 连接池、TCP 重置）。每个 API 调用块
+                        # 仅尝试一次。
                         if not primary_recovery_attempted and self._try_recover_primary_transport(
                             api_error, retry_count=retry_count, max_retries=max_retries,
                         ):
                             primary_recovery_attempted = True
                             retry_count = 0
                             continue
-                        # Try fallback before giving up entirely
+                        # 在完全放弃之前尝试回退
                         self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                         if self._try_activate_fallback():
                             retry_count = 0
@@ -10695,11 +10692,11 @@ class AIAgent:
                             self._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
                         self._vprint(f"{self.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
-                        # Detect SSE stream-drop pattern (e.g. "Network
-                        # connection lost") and surface actionable guidance.
-                        # This typically happens when the model generates a
-                        # very large tool call (write_file with huge content)
-                        # and the proxy/CDN drops the stream mid-response.
+                        # 检测 SSE 流丢弃模式（例如 "Network
+                        # connection lost"）并提供可操作的指导。
+                        # 这通常发生在模型生成
+                        # 非常大的工具调用（包含大量内容的 write_file）
+                        # 并且代理/CDN 在响应中途丢弃流时。
                         _is_stream_drop = (
                             not getattr(api_error, "status_code", None)
                             and any(p in error_msg for p in (
@@ -10753,7 +10750,7 @@ class AIAgent:
                             "error": _final_summary,
                         }
 
-                    # For rate limits, respect the Retry-After header if present
+                    # 对于速率限制，如果存在则尊重 Retry-After 标头
                     _retry_after = None
                     if is_rate_limited:
                         _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
@@ -10761,7 +10758,7 @@ class AIAgent:
                             _ra_raw = _resp_headers.get("retry-after") or _resp_headers.get("Retry-After")
                             if _ra_raw:
                                 try:
-                                    _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
+                                    _retry_after = min(int(_ra_raw), 120)  # 上限 2 分钟
                                 except (TypeError, ValueError):
                                     pass
                     wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
@@ -10777,8 +10774,8 @@ class AIAgent:
                         self._client_log_context(),
                         api_error,
                     )
-                    # Sleep in small increments so we can respond to interrupts quickly
-                    # instead of blocking the entire wait_time in one sleep() call
+                    # 以小增量睡眠，以便我们可以快速响应中断
+                    # 而不是在一个 sleep() 调用中阻塞整个 wait_time
                     sleep_end = time.time() + wait_time
                     _backoff_touch_counter = 0
                     while time.time() < sleep_end:
@@ -10793,9 +10790,9 @@ class AIAgent:
                                 "completed": False,
                                 "interrupted": True,
                             }
-                        time.sleep(0.2)  # Check interrupt every 200ms
-                        # Touch activity every ~30s so the gateway's inactivity
-                        # monitor knows we're alive during backoff waits.
+                        time.sleep(0.2)  # 每 200ms 检查中断
+                        # 每 ~30 秒触摸一次活动，以便网关的非活动
+                        # 监视器知道我们在退避等待期间仍然活着。
                         _backoff_touch_counter += 1
                         if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
                             self._touch_activity(
@@ -10803,7 +10800,7 @@ class AIAgent:
                                 f"{int(sleep_end - time.time())}s remaining"
                             )
             
-            # If the API call was interrupted, skip response processing
+            # 如果 API 调用被中断，跳过响应处理
             if interrupted:
                 _turn_exit_reason = "interrupted_during_api_call"
                 break
@@ -10811,25 +10808,25 @@ class AIAgent:
             if restart_with_compressed_messages:
                 api_call_count -= 1
                 self.iteration_budget.refund()
-                # Count compression restarts toward the retry limit to prevent
-                # infinite loops when compression reduces messages but not enough
-                # to fit the context window.
+                # 将压缩重启计入重试限制以防止
+                # 无限循环，当压缩减少消息但不足以
+                # 适应上下文窗口时。
                 retry_count += 1
                 restart_with_compressed_messages = False
                 continue
 
             if restart_with_length_continuation:
-                # Progressively boost the output token budget on each retry.
-                # Retry 1 → 2× base, retry 2 → 3× base, capped at 32 768.
-                # Applies to all providers via _ephemeral_max_output_tokens.
+                # 在每次重试时逐步提高输出令牌预算。
+                # 重试 1 → 2× 基数，重试 2 → 3× 基数，上限为 32 768。
+                # 通过 _ephemeral_max_output_tokens 适用于所有提供商。
                 _boost_base = self.max_tokens if self.max_tokens else 4096
                 _boost = _boost_base * (length_continue_retries + 1)
                 self._ephemeral_max_output_tokens = min(_boost, 32768)
                 continue
 
-            # Guard: if all retries exhausted without a successful response
-            # (e.g. repeated context-length errors that exhausted retry_count),
-            # the `response` variable is still None. Break out cleanly.
+            # 保护：如果所有重试都用尽而没有成功响应
+            # （例如耗尽 retry_count 的重复上下文长度错误），
+            # `response` 变量仍然是 None。干净地跳出。
             if response is None:
                 _turn_exit_reason = "all_retries_exhausted_no_response"
                 print(f"{self.log_prefix}❌ All API retries exhausted with no successful response.")
@@ -10847,15 +10844,15 @@ class AIAgent:
                 else:
                     assistant_message = response.choices[0].message
                 
-                # Normalize content to string — some OpenAI-compatible servers
-                # (llama-server, etc.) return content as a dict or list instead
-                # of a plain string, which crashes downstream .strip() calls.
+                # 将内容标准化为字符串 — 一些 OpenAI 兼容服务器
+                # （llama-server 等）将内容作为字典或列表而不是
+                # 普通字符串返回，这会导致下游 .strip() 调用崩溃。
                 if assistant_message.content is not None and not isinstance(assistant_message.content, str):
                     raw = assistant_message.content
                     if isinstance(raw, dict):
                         assistant_message.content = raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
                     elif isinstance(raw, list):
-                        # Multimodal content list — extract text parts
+                        # 多模态内容列表 — 提取文本部分
                         parts = []
                         for part in raw:
                             if isinstance(part, str):
@@ -10900,16 +10897,16 @@ class AIAgent:
                     else:
                         self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-                # Notify progress callback of model's thinking (used by subagent
-                # delegation to relay the child's reasoning to the parent display).
+                # 通知模型思考的进度回调（由子代理
+                # 委托用于将子级的推理传递给父级显示）。
                 if (assistant_message.content and self.tool_progress_callback):
                     _think_text = assistant_message.content.strip()
-                    # Strip reasoning XML tags that shouldn't leak to parent display
+                    # 剥除不应泄露到父级显示的推理 XML 标签
                     _think_text = re.sub(
                         r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
                     ).strip()
-                    # For subagents: relay first line to parent display (existing behaviour).
-                    # For all agents with a structured callback: emit reasoning.available event.
+                    # 对于子代理：将第一行传递给父级显示（现有行为）。
+                    # 对于具有结构化回调的所有代理：发出 reasoning.available 事件。
                     first_line = _think_text.split('\n')[0][:80] if _think_text else ""
                     if first_line and getattr(self, '_delegate_depth', 0) > 0:
                         try:
@@ -10922,8 +10919,8 @@ class AIAgent:
                         except Exception:
                             pass
                 
-                # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
-                # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
+                # 检查不完整的 <REASONING_SCRATCHPAD>（已打开但从未关闭）
+                # 这意味着模型在推理中途耗尽了输出令牌 — 最多重试 2 次
                 if has_incomplete_scratchpad(assistant_message.content or ""):
                     self._incomplete_scratchpad_retries += 1
                     
@@ -10931,10 +10928,10 @@ class AIAgent:
                     
                     if self._incomplete_scratchpad_retries <= 2:
                         self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._incomplete_scratchpad_retries}/2)...")
-                        # Don't add the broken message, just retry
+                        # 不要添加损坏的消息，只需重试
                         continue
                     else:
-                        # Max retries - discard this turn and save as partial
+                        # 最大重试次数 - 丢弃此回合并保存为部分
                         self._vprint(f"{self.log_prefix}❌ Max retries (2) for incomplete scratchpad. Saving as partial.", force=True)
                         self._incomplete_scratchpad_retries = 0
                         
@@ -10951,7 +10948,7 @@ class AIAgent:
                             "error": "Incomplete REASONING_SCRATCHPAD after 2 retries"
                         }
                 
-                # Reset incomplete scratchpad counter on clean response
+                # 在干净响应时重置不完整草稿板计数器
                 self._incomplete_scratchpad_retries = 0
 
                 if self.api_mode == "codex_responses" and finish_reason == "incomplete":
@@ -10964,11 +10961,11 @@ class AIAgent:
 
                     if interim_has_content or interim_has_reasoning or interim_has_codex_reasoning:
                         last_msg = messages[-1] if messages else None
-                        # Duplicate detection: two consecutive incomplete assistant
-                        # messages with identical content AND reasoning are collapsed.
-                        # For reasoning-only messages (codex_reasoning_items differ but
-                        # visible content/reasoning are both empty), we also compare
-                        # the encrypted items to avoid silently dropping new state.
+                        # 重复检测：两个连续的不完整助手
+                        # 消息具有相同的内容和推理将被合并。
+                        # 对于仅推理消息（codex_reasoning_items 不同但
+                        # 可见内容/推理都为空），我们还比较
+                        # 加密项以避免静默丢弃新状态。
                         last_codex_items = last_msg.get("codex_reasoning_items") if isinstance(last_msg, dict) else None
                         interim_codex_items = interim_msg.get("codex_reasoning_items")
                         duplicate_interim = (
@@ -11012,8 +11009,8 @@ class AIAgent:
                         for tc in assistant_message.tool_calls:
                             logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
                     
-                    # Validate tool call names - detect model hallucinations
-                    # Repair mismatched tool names before validating
+                    # 验证工具调用名称 - 检测模型幻觉
+                    # 在验证之前修复不匹配的工具名称
                     for tc in assistant_message.tool_calls:
                         if tc.function.name not in self.valid_tool_names:
                             repaired = self._repair_tool_call(tc.function.name)
@@ -11028,7 +11025,7 @@ class AIAgent:
                         # Track retries for invalid tool calls
                         self._invalid_tool_retries += 1
 
-                        # Return helpful error to model — model can self-correct next turn
+                        # 向模型返回有用的错误 — 模型可以在下一回合自我纠正
                         available = ", ".join(sorted(self.valid_tool_names))
                         invalid_name = invalid_tool_calls[0]
                         invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
@@ -11060,11 +11057,11 @@ class AIAgent:
                                 "content": content,
                             })
                         continue
-                    # Reset retry counter on successful tool call validation
+                    # 成功工具调用验证时重置重试计数器
                     self._invalid_tool_retries = 0
                     
-                    # Validate tool call arguments are valid JSON
-                    # Handle empty strings as empty objects (common model quirk)
+                    # 验证工具调用参数是有效的 JSON
+                    # 将空字符串作为空对象处理（常见的模型怪癖）
                     invalid_json_args = []
                     for tc in assistant_message.tool_calls:
                         args = tc.function.arguments
@@ -11084,12 +11081,12 @@ class AIAgent:
                             invalid_json_args.append((tc.function.name, str(e)))
                     
                     if invalid_json_args:
-                        # Check if the invalid JSON is due to truncation rather
-                        # than a model formatting mistake.  Routers sometimes
-                        # rewrite finish_reason from "length" to "tool_calls",
-                        # hiding the truncation from the length handler above.
-                        # Detect truncation: args that don't end with } or ]
-                        # (after stripping whitespace) are cut off mid-stream.
+                        # 检查无效 JSON 是否是由于截断而不是
+                        # 模型格式错误。路由器有时
+                        # 将 finish_reason 从 "length" 重写为 "tool_calls"，
+                        # 从上面的长度处理器隐藏截断。
+                        # 检测截断：不以 } 或 ] 结尾的参数
+                        # （去除空白后）是在流中途被切断的。
                         _truncated = any(
                             not (tc.function.arguments or "").rstrip().endswith(("}", "]"))
                             for tc in assistant_message.tool_calls
@@ -11124,16 +11121,16 @@ class AIAgent:
                             # Don't add anything to messages, just retry the API call
                             continue
                         else:
-                            # Instead of returning partial, inject tool error results so the model can recover.
-                            # Using tool results (not user messages) preserves role alternation.
+                            # 不是返回部分，而是注入工具错误结果以便模型可以恢复。
+                            # 使用工具结果（不是用户消息）保持角色交替。
                             self._vprint(f"{self.log_prefix}⚠️  Injecting recovery tool results for invalid JSON...")
                             self._invalid_json_retries = 0  # Reset for next attempt
                             
-                            # Append the assistant message with its (broken) tool_calls
+                            # 附加助手消息及其（损坏的）tool_calls
                             recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)
                             messages.append(recovery_assistant)
                             
-                            # Respond with tool error results for each tool call
+                            # 对每个工具调用响应工具错误结果
                             invalid_names = {name for name, _ in invalid_json_args}
                             for tc in assistant_message.tool_calls:
                                 if tc.function.name in invalid_names:
@@ -11152,10 +11149,10 @@ class AIAgent:
                                 })
                             continue
                     
-                    # Reset retry counter on successful JSON validation
+                    # 成功 JSON 验证时重置重试计数器
                     self._invalid_json_retries = 0
 
-                    # ── Post-call guardrails ──────────────────────────
+                    # ── 调用后护栏 ──────────────────────────
                     assistant_message.tool_calls = self._cap_delegate_task_calls(
                         assistant_message.tool_calls
                     )
@@ -11165,10 +11162,10 @@ class AIAgent:
 
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                     
-                    # If this turn has both content AND tool_calls, capture the content
-                    # as a fallback final response. Common pattern: model delivers its
-                    # answer and calls memory/skill tools as a side-effect in the same
-                    # turn. If the follow-up turn after tools is empty, we use this.
+                    # 如果此回合同时具有 content 和 tool_calls，则捕获内容
+                    # 作为回退最终响应。常见模式：模型在同一回合中
+                    # 传递其答案并调用内存/技能工具作为副作用。
+                    # 如果工具后的后续回合为空，我们使用这个。
                     turn_content = assistant_message.content or ""
                     if turn_content and self._has_content_after_think_block(turn_content):
                         self._last_content_with_tools = turn_content
@@ -11192,8 +11189,8 @@ class AIAgent:
                             if clean:
                                 self._vprint(f"  ┊ 💬 {clean}")
                     
-                    # Pop thinking-only prefill message(s) before appending
-                    # (tool-call path — same rationale as the final-response path).
+                    # 在附加之前弹出仅思考的预填充消息
+                    # （工具调用路径 — 与最终响应路径的理由相同）。
                     _had_prefill = False
                     while (
                         messages
@@ -11203,30 +11200,31 @@ class AIAgent:
                         messages.pop()
                         _had_prefill = True
 
-                    # Reset prefill counter when tool calls follow a prefill
-                    # recovery.  Without this, the counter accumulates across
-                    # the whole conversation — a model that intermittently
-                    # empties (empty → prefill → tools → empty → prefill →
-                    # tools) burns both prefill attempts and the third empty
-                    # gets zero recovery.  Resetting here treats each tool-
-                    # call success as a fresh start.
+                    # 当工具调用跟在预填充
+                    # 恢复之后时重置预填充计数器。
+                    # 没有这个，计数器会在整个
+                    # 对话中累积 — 间歇性
+                    # 清空的模型（empty → prefill → tools → empty → prefill →
+                    # tools）会消耗两次预填充尝试，第三次清空
+                    # 得到零恢复。在这里重置将每个工具
+                    # 调用成功视为新的开始。
                     if _had_prefill:
                         self._thinking_prefill_retries = 0
                         self._empty_content_retries = 0
-                    # Successful tool execution — reset the post-tool nudge
-                    # flag so it can fire again if the model goes empty on
-                    # a LATER tool round.
+                    # 成功的工具执行 — 重置工具后推动
+                    # 标志，以便如果模型在稍后的
+                    # 工具回合中清空，它可以再次触发。
                     self._post_tool_empty_retried = False
 
                     messages.append(assistant_msg)
                     self._emit_interim_assistant_message(assistant_msg)
 
-                    # Close any open streaming display (response box, reasoning
-                    # box) before tool execution begins.  Intermediate turns may
-                    # have streamed early content that opened the response box;
-                    # flushing here prevents it from wrapping tool feed lines.
-                    # Only signal the display callback — TTS (_stream_callback)
-                    # should NOT receive None (it uses None as end-of-stream).
+                    # 在工具执行开始之前关闭任何打开的流式显示（响应框、推理
+                    # 框）。中间回合可能
+                    # 已经流式传输了打开响应框的早期内容；
+                    # 在此处刷新可防止它包装工具馈送行。
+                    # 仅向显示回调发出信号 — TTS（_stream_callback）
+                    # 不应接收 None（它使用 None 作为流结束）。
                     if self.stream_delta_callback:
                         try:
                             self.stream_delta_callback(None)
@@ -11235,40 +11233,41 @@ class AIAgent:
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
-                    # Reset per-turn retry counters after successful tool
-                    # execution so a single truncation doesn't poison the
-                    # entire conversation.
+                    # 成功工具执行后重置每回合重试计数器，
+                    # 这样单次截断不会毒害
+                    # 整个对话。
                     truncated_tool_call_retries = 0
 
-                    # Signal that a paragraph break is needed before the next
-                    # streamed text.  We don't emit it immediately because
-                    # multiple consecutive tool iterations would stack up
-                    # redundant blank lines.  Instead, _fire_stream_delta()
-                    # will prepend a single "\n\n" the next time real text
-                    # arrives.
+                    # 发出信号表示在下一次
+                    # 流式文本之前需要段落中断。
+                    # 我们不立即发出它，因为
+                    # 多个连续的工具迭代会堆积
+                    # 冗余的空行。相反，_fire_stream_delta()
+                    # 将在下一次真实文本
+                    # 到达时前置单个 "\n\n"。
                     self._stream_needs_break = True
 
-                    # Refund the iteration if the ONLY tool(s) called were
-                    # execute_code (programmatic tool calling).  These are
-                    # cheap RPC-style calls that shouldn't eat the budget.
+                    # 如果调用的唯一工具是
+                    # execute_code（程序化工具调用），则退回迭代。
+                    # 这些是廉价的 RPC 风格调用，不应消耗预算。
                     _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                     if _tc_names == {"execute_code"}:
                         self.iteration_budget.refund()
                     
-                    # Use real token counts from the API response to decide
-                    # compression.  prompt_tokens + completion_tokens is the
-                    # actual context size the provider reported plus the
-                    # assistant turn — a tight lower bound for the next prompt.
-                    # Tool results appended above aren't counted yet, but the
-                    # threshold (default 50%) leaves ample headroom; if tool
-                    # results push past it, the next API call will report the
-                    # real total and trigger compression then.
+                    # 使用来自 API 响应的真实令牌计数来决定
+                    # 压缩。prompt_tokens + completion_tokens 是
+                    # 提供商报告的实际上下文大小加上
+                    # 助手回合 — 下一个提示的紧密下限。
+                    # 上面附加的工具结果尚未计算，但
+                    # 阈值（默认 50%）留有足够的余地；如果工具
+                    # 结果超过它，下一次 API 调用将报告
+                    # 实际总数并在那时触发压缩。
                     #
-                    # If last_prompt_tokens is 0 (stale after API disconnect
-                    # or provider returned no usage data), fall back to rough
-                    # estimate to avoid missing compression.  Without this,
-                    # a session can grow unbounded after disconnects because
-                    # should_compress(0) never fires.  (#2153)
+                    # 如果 last_prompt_tokens 为 0（API 断开连接后陈旧
+                    # 或提供商未返回使用数据），则回退到粗略
+                    # 估计以避免错过压缩。没有这个，
+                    # 会话在断开连接后可以无限增长，因为
+                    # should_compress(0) 永远不会触发。（#2153）
                     _compressor = self.context_compressor
                     if _compressor.last_prompt_tokens > 0:
                         _real_tokens = (
@@ -11285,12 +11284,12 @@ class AIAgent:
                             approx_tokens=self.context_compressor.last_prompt_tokens,
                             task_id=effective_task_id,
                         )
-                        # Compression created a new session — clear history so
-                        # _flush_messages_to_session_db writes compressed messages
-                        # to the new session (see preflight compression comment).
+                        # 压缩创建了新会话 — 清除历史，以便
+                        # _flush_messages_to_session_db 将压缩消息
+                        # 写入新会话（参见预压缩注释）。
                         conversation_history = None
                     
-                    # Save session log incrementally (so progress is visible even if interrupted)
+                    # 增量保存会话日志（即使中断也可见进度）
                     self._session_messages = messages
                     self._save_session_log(messages)
                     
@@ -11298,23 +11297,24 @@ class AIAgent:
                     continue
                 
                 else:
-                    # No tool calls - this is the final response
+                    # 没有工具调用 - 这是最终响应
                     final_response = assistant_message.content or ""
                     
-                    # Fix: unmute output when entering the no-tool-call branch
-                    # so the user can see empty-response warnings and recovery
-                    # status messages.  _mute_post_response was set during a
-                    # prior housekeeping tool turn and should not silence the
-                    # final response path.
+                    # 修复：进入无工具调用分支时取消静音输出，
+                    # 以便用户可以看到空响应警告和恢复
+                    # 状态消息。_mute_post_response 是在之前的
+                    # 清理工具回合中设置的，不应静默
+                    # 最终响应路径。
                     self._mute_post_response = False
                     
-                    # Check if response only has think block with no actual content after it
+                    # 检查响应是否只有思考块，其后没有实际内容
                     if not self._has_content_after_think_block(final_response):
-                        # ── Partial stream recovery ─────────────────────
-                        # If content was already streamed to the user before
-                        # the connection died, use it as the final response
-                        # instead of falling through to prior-turn fallback
-                        # or wasting API calls on retries.
+                        # ── 部分流恢复 ─────────────────────
+                        # 如果内容在连接
+                        # 死亡之前已经流式传输给用户，
+                        # 则将其用作最终响应，
+                        # 而不是回退到先前回合的回退
+                        # 或在重试上浪费 API 调用。
                         _partial_streamed = (
                             getattr(self, "_current_streamed_assistant_text", "") or ""
                         )
@@ -11334,16 +11334,17 @@ class AIAgent:
                             self._response_was_previewed = True
                             break
 
-                        # If the previous turn already delivered real content alongside
-                        # HOUSEKEEPING tool calls (e.g. "You're welcome!" + memory save),
-                        # the model has nothing more to say. Use the earlier content
-                        # immediately instead of wasting API calls on retries.
-                        # NOTE: Only use this shortcut when ALL tools in that turn were
-                        # housekeeping (memory, todo, etc.).  When substantive tools
-                        # were called (terminal, search_files, etc.), the content was
-                        # likely mid-task narration ("I'll scan the directory...") and
-                        # the empty follow-up means the model choked — let the
-                        # post-tool nudge below handle that instead of exiting early.
+                        # 如果先前回合已经与清理工具调用一起
+                        # 传递了真实内容（例如 "You're welcome!" + 内存保存），
+                        # 模型没有更多要说的。立即使用较早的内容
+                        # 而不是在重试上浪费 API 调用。
+                        # 注意：仅当该回合中的所有工具都是
+                        # 清理（内存、待办事项等）时才使用此快捷方式。
+                        # 当调用了实质性工具
+                        # （terminal、search_files 等）时，内容可能是
+                        # 任务中段叙述（"I'll scan the directory..."），
+                        # 空的后续意味着模型窒息 — 让下面的
+                        # 工具后推动处理而不是提前退出。
                         fallback = getattr(self, '_last_content_with_tools', None)
                         if fallback and getattr(self, '_last_content_tools_all_housekeeping', False):
                             _turn_exit_reason = "fallback_prior_turn_content"
@@ -11352,27 +11353,27 @@ class AIAgent:
                             self._last_content_with_tools = None
                             self._last_content_tools_all_housekeeping = False
                             self._empty_content_retries = 0
-                            # Do NOT modify the assistant message content — the
-                            # old code injected "Calling the X tools..." which
-                            # poisoned the conversation history.  Just use the
-                            # fallback text as the final response and break.
+                            # 不要修改助手消息内容 — 
+                            # 旧代码注入了 "Calling the X tools..."，
+                            # 这毒化了对话历史。只需使用
+                            # 回退文本作为最终响应并中断。
                             final_response = self._strip_think_blocks(fallback).strip()
                             self._response_was_previewed = True
                             break
 
-                        # ── Post-tool-call empty response nudge ───────────
-                        # The model returned empty after executing tool calls.
-                        # This covers two cases:
-                        #  (a) No prior-turn content at all — model went silent
-                        #  (b) Prior turn had content + SUBSTANTIVE tools (the
-                        #      fallback above was skipped because the content
-                        #      was mid-task narration, not a final answer)
-                        # Instead of giving up, nudge the model to continue by
-                        # appending a user-level hint.  This is the #9400 case:
-                        # weaker models (mimo-v2-pro, GLM-5, etc.) sometimes
-                        # return empty after tool results instead of continuing
-                        # to the next step.  One retry with a nudge usually
-                        # fixes it.
+                        # ── 工具调用后空响应推动 ───────────
+                        # 模型在执行工具调用后返回空。
+                        # 这涵盖两种情况：
+                        #  (a) 根本没有先前回合的内容 — 模型静默
+                        #  (b) 先前回合有内容 + 实质性工具（
+                        #      上面的回退被跳过，因为内容
+                        #      是任务中段叙述，而不是最终答案）
+                        # 不是放弃，而是通过
+                        # 附加用户级提示来推动模型继续。这是 #9400 情况：
+                        # 较弱的模型（mimo-v2-pro、GLM-5 等）有时
+                        # 在工具结果后返回空，而不是继续
+                        # 到下一步。一次带推动的重试通常
+                        # 可以修复它。
                         _prior_was_tool = any(
                             m.get("role") == "tool"
                             for m in messages[-5:]  # check recent messages
@@ -11382,8 +11383,8 @@ class AIAgent:
                             and not getattr(self, "_post_tool_empty_retried", False)
                         ):
                             self._post_tool_empty_retried = True
-                            # Clear stale narration so it doesn't resurface
-                            # on a later empty response after the nudge.
+                            # 清除陈旧的叙述，以便在推动后的
+                            # 稍后空响应中不会重新出现。
                             self._last_content_with_tools = None
                             self._last_content_tools_all_housekeeping = False
                             logger.info(
@@ -11394,11 +11395,11 @@ class AIAgent:
                                 "⚠️ Model returned empty after tool calls — "
                                 "nudging to continue"
                             )
-                            # Append the empty assistant message first so the
-                            # message sequence stays valid:
+                            # 首先附加空助手消息，以便
+                            # 消息序列保持有效：
                             #   tool(result) → assistant("(empty)") → user(nudge)
-                            # Without this, we'd have tool → user which most
-                            # APIs reject as an invalid sequence.
+                            # 没有这个，我们将有 tool → user，大多数
+                            # API 会将其拒绝为无效序列。
                             _nudge_msg = self._build_assistant_message(assistant_message, finish_reason)
                             _nudge_msg["content"] = "(empty)"
                             messages.append(_nudge_msg)
@@ -11412,13 +11413,13 @@ class AIAgent:
                             })
                             continue
 
-                        # ── Thinking-only prefill continuation ──────────
-                        # The model produced structured reasoning (via API
-                        # fields) but no visible text content.  Rather than
-                        # giving up, append the assistant message as-is and
-                        # continue — the model will see its own reasoning
-                        # on the next turn and produce the text portion.
-                        # Inspired by clawdbot's "incomplete-text" recovery.
+                        # ── 仅思考预填充继续 ──────────
+                        # 模型产生了结构化推理（通过 API
+                        # 字段）但没有可见的文本内容。不是
+                        # 放弃，而是按原样附加助手消息并
+                        # 继续 — 模型将在下一回合看到自己的推理
+                        # 并产生文本部分。
+                        # 受 clawdbot 的 "incomplete-text" 恢复启发。
                         _has_structured = bool(
                             getattr(assistant_message, "reasoning", None)
                             or getattr(assistant_message, "reasoning_content", None)
@@ -11444,15 +11445,15 @@ class AIAgent:
                             self._save_session_log(messages)
                             continue
 
-                        # ── Empty response retry ──────────────────────
-                        # Model returned nothing usable.  Retry up to 3
-                        # times before attempting fallback.  This covers
-                        # both truly empty responses (no content, no
-                        # reasoning) AND reasoning-only responses after
-                        # prefill exhaustion — models like mimo-v2-pro
-                        # always populate reasoning fields via OpenRouter,
-                        # so the old `not _has_structured` guard blocked
-                        # retries for every reasoning model after prefill.
+                        # ── 空响应重试 ──────────────────────
+                        # 模型没有返回任何有用的东西。在尝试回退之前重试最多 3
+                        # 次。这涵盖
+                        # 真正的空响应（没有内容、没有
+                        # 推理）和预填充耗尽后的仅推理响应 — 
+                        # 像 mimo-v2-pro 这样的模型
+                        # 通过 OpenRouter 始终填充推理字段，
+                        # 因此旧的 `not _has_structured` 守卫阻止了
+                        # 预填充后每个推理模型的重试。
                         _truly_empty = not self._strip_think_blocks(
                             final_response
                         ).strip()
@@ -11473,12 +11474,11 @@ class AIAgent:
                             )
                             continue
 
-                        # ── Exhausted retries — try fallback provider ──
-                        # Before giving up with "(empty)", attempt to
-                        # switch to the next provider in the fallback
-                        # chain.  This covers the case where a model
-                        # (e.g. GLM-4.5-Air) consistently returns empty
-                        # due to context degradation or provider issues.
+                        # ── 重试耗尽 — 尝试回退提供商 ──
+                        # 在用 "(empty)" 放弃之前，尝试
+                        # 切换到回退链中的下一个提供商。
+                        # 这涵盖模型（例如 GLM-4.5-Air）由于上下文退化或提供商问题
+                        # 持续返回空的情况。
                         if _truly_empty and self._fallback_chain:
                             logger.warning(
                                 "Empty response after %d retries — "
@@ -11503,9 +11503,9 @@ class AIAgent:
                                 )
                                 continue
 
-                        # Exhausted retries and fallback chain (or no
-                        # fallback configured).  Fall through to the
-                        # "(empty)" terminal.
+                        # 重试和回退链耗尽（或没有
+                        # 配置回退）。进入
+                        # "(empty)" 终端。
                         _turn_exit_reason = "empty_response_exhausted"
                         reasoning_text = self._extract_reasoning(assistant_message)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
@@ -11540,7 +11540,7 @@ class AIAgent:
                         final_response = "(empty)"
                         break
                     
-                    # Reset retry counter/signature on successful content
+                    # 成功内容时重置重试计数器/签名
                     self._empty_content_retries = 0
                     self._thinking_prefill_retries = 0
 
@@ -11573,20 +11573,21 @@ class AIAgent:
 
                     codex_ack_continuations = 0
 
-                    if truncated_response_prefix:
                         final_response = truncated_response_prefix + final_response
                         truncated_response_prefix = ""
                         length_continue_retries = 0
                     
+                    # 从面向用户的响应中剥离 <think> 块（在消息中为轨迹保留原始）
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
                     final_response = self._strip_think_blocks(final_response).strip()
                     
                     final_msg = self._build_assistant_message(assistant_message, finish_reason)
 
-                    # Pop thinking-only prefill message(s) before appending
-                    # the final response.  This avoids consecutive assistant
-                    # messages which break strict-alternation providers
-                    # (Anthropic Messages API) and keeps history clean.
+                    # 在附加最终响应之前弹出仅思考的预填充消息。
+                    # 在附加最终响应之前弹出仅思考的预填充消息。
+                    # 这避免了连续的助手
+                    # 消息，这些消息会破坏严格交替的提供商
+                    #（Anthropic Messages API）并保持历史干净。
                     while (
                         messages
                         and isinstance(messages[-1], dict)
@@ -11610,9 +11611,9 @@ class AIAgent:
                 
                 logger.debug("Outer loop error in API call #%d", api_call_count, exc_info=True)
                 
-                # If an assistant message with tool_calls was already appended,
-                # the API expects a role="tool" result for every tool_call_id.
-                # Fill in error results for any that weren't answered yet.
+                # 如果已经附加了带有 tool_calls 的助手消息，
+                # API 期望每个 tool_call_id 都有 role="tool" 结果。
+                # 为任何尚未回答的填充错误结果。
                 for idx in range(len(messages) - 1, -1, -1):
                     msg = messages[idx]
                     if not isinstance(msg, dict):
@@ -11636,18 +11637,18 @@ class AIAgent:
                                 messages.append(err_msg)
                     break
                 
-                # Non-tool errors don't need a synthetic message injected.
-                # The error is already printed to the user (line above), and
-                # the retry loop continues.  Injecting a fake user/assistant
-                # message pollutes history, burns tokens, and risks violating
-                # role-alternation invariants.
+                # 非工具错误不需要注入合成消息。
+                # 错误已经打印给用户（上文），
+                # 重试循环继续。注入假的用户/助手
+                # 消息会污染历史、消耗令牌，并有可能违反
+                # 角色交替不变量。
 
-                # If we're near the limit, break to avoid infinite loops
+                # 如果我们接近限制，中断以避免无限循环
                 if api_call_count >= self.max_iterations - 1:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
-                    # Append as assistant so the history stays valid for
-                    # session resume (avoids consecutive user messages).
+                    # 作为助手附加，以便历史对于
+                    # 会话恢复保持有效（避免连续的用户消息）。
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
@@ -11655,9 +11656,10 @@ class AIAgent:
             api_call_count >= self.max_iterations
             or self.iteration_budget.remaining <= 0
         ):
-            # Budget exhausted — ask the model for a summary via one extra
-            # API call with tools stripped.  _handle_max_iterations injects a
-            # user message and makes a single toolless request.
+            # 预算耗尽 — 通过一次额外的
+            # API 调用要求模型总结，剥离工具。
+            # _handle_max_iterations 注入一个
+            # 用户消息并进行一次无工具请求。
             _turn_exit_reason = f"max_iterations_reached({api_call_count}/{self.max_iterations})"
             self._emit_status(
                 f"⚠️ Iteration budget exhausted ({api_call_count}/{self.max_iterations}) "
@@ -11670,26 +11672,26 @@ class AIAgent:
                 )
             final_response = self._handle_max_iterations(messages, api_call_count)
         
-        # Determine if conversation completed successfully
+        # 确定对话是否成功完成
         completed = final_response is not None and api_call_count < self.max_iterations
 
-        # Save trajectory if enabled
+        # 如果启用则保存轨迹
         self._save_trajectory(messages, user_message, completed)
 
-        # Clean up VM and browser for this task after conversation completes
+        # 对话完成后清理此任务的 VM 和浏览器
         self._cleanup_task_resources(effective_task_id)
 
-        # Persist session to both JSON log and SQLite
+        # 将会话持久化到 JSON 日志和 SQLite
         self._persist_session(messages, conversation_history)
 
-        # ── Turn-exit diagnostic log ─────────────────────────────────────
-        # Always logged at INFO so agent.log captures WHY every turn ended.
-        # When the last message is a tool result (agent was mid-work), log
-        # at WARNING — this is the "just stops" scenario users report.
+        # ── 回合退出诊断日志 ─────────────────────────────────────
+        # 始终在 INFO 级别记录，以便 agent.log 捕获每个回合结束的原因。
+        # 当最后一条消息是工具结果（代理正在工作中）时，在
+        # WARNING 级别记录 — 这是用户报告的"突然停止"场景。
         _last_msg_role = messages[-1].get("role") if messages else None
         _last_tool_name = None
         if _last_msg_role == "tool":
-            # Walk back to find the assistant message with the tool call
+            # 回溯查找带有工具调用的助手消息
             for _m in reversed(messages):
                 if _m.get("role") == "assistant" and _m.get("tool_calls"):
                     _tcs = _m["tool_calls"]
@@ -11717,7 +11719,7 @@ class AIAgent:
         )
 
         if _last_msg_role == "tool" and not interrupted:
-            # Agent was mid-work — this is the "just stops" case.
+            # 代理正在工作中 — 这是"突然停止"的情况。
             logger.warning(
                 "Turn ended with pending tool result (agent may appear stuck). "
                 + _diag_msg + " last_tool=%s",
@@ -11726,10 +11728,10 @@ class AIAgent:
         else:
             logger.info(_diag_msg, *_diag_args)
 
-        # Plugin hook: post_llm_call
-        # Fired once per turn after the tool-calling loop completes.
-        # Plugins can use this to persist conversation data (e.g. sync
-        # to an external memory system).
+        # 插件钩子：post_llm_call
+        # 在工具调用循环完成后每回合触发一次。
+        # 插件可以使用此钩子持久化对话数据（例如同步
+        # 到外部内存系统）。
         if final_response and not interrupted:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -11745,21 +11747,21 @@ class AIAgent:
             except Exception as exc:
                 logger.warning("post_llm_call hook failed: %s", exc)
 
-        # Extract reasoning from the last assistant message (if any)
+        # 从最后一条助手消息中提取推理（如果有）
         last_reasoning = None
         for msg in reversed(messages):
             if msg.get("role") == "assistant" and msg.get("reasoning"):
                 last_reasoning = msg["reasoning"]
                 break
 
-        # Build result with interrupt info if applicable
+        # 如果适用，使用中断信息构建结果
         result = {
             "final_response": final_response,
             "last_reasoning": last_reasoning,
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,
-            "partial": False,  # True only when stopped due to invalid tool calls
+            "partial": False,  # 仅在由于无效工具调用而停止时为 True
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
             "model": self.model,
@@ -11778,35 +11780,32 @@ class AIAgent:
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
         }
-        # If a /steer landed after the final assistant turn (no more tool
-        # batches to drain into), hand it back to the caller so it can be
-        # delivered as the next user turn instead of being silently lost.
+        # 如果 /steer 在最终助手回合之后到达（没有更多工具
+        # 批次可排入），将其交还给调用者，以便它可以
+        # 作为下一个用户回合传递，而不是静默丢失。
         _leftover_steer = self._drain_pending_steer()
         if _leftover_steer:
             result["pending_steer"] = _leftover_steer
         self._response_was_previewed = False
         
-        # Include interrupt message if one triggered the interrupt
+        # 如果有中断消息触发了中断，则包含它
         if interrupted and self._interrupt_message:
             result["interrupt_message"] = self._interrupt_message
         
-        # Clear interrupt state after handling
+        # 处理后清除中断状态
         self.clear_interrupt()
 
-        # Clear stream callback so it doesn't leak into future calls
+        # 清除流回调，以免泄漏到未来的调用中
         self._stream_callback = None
 
-        # Check skill trigger NOW — based on how many tool iterations THIS turn used.
-        _should_review_skills = False
-        if (self._skill_nudge_interval > 0
-                and self._iters_since_skill >= self._skill_nudge_interval
-                and "skill_manage" in self.valid_tool_names):
-            _should_review_skills = True
-            self._iters_since_skill = 0
+        # 现在检查技能触发 — 基于此回合使用的工具迭代次数。
+        _should_review_skills = self.skill_evolution.should_review_after_turn(
+            self.valid_tool_names
+        )
 
-        # External memory provider: sync the completed turn + queue next prefetch.
-        # Use original_user_message (clean input) — user_message may contain
-        # injected skill content that bloats / breaks provider queries.
+        # 外部内存提供商：同步完成的回合 + 排队下一次预取。
+        # 使用 original_user_message（干净输入）— user_message 可能包含
+        # 注入的技能内容，这些内容会膨胀/破坏提供商查询。
         if self._memory_manager and final_response and original_user_message:
             try:
                 self._memory_manager.sync_all(original_user_message, final_response)
@@ -11814,8 +11813,8 @@ class AIAgent:
             except Exception:
                 pass
 
-        # Background memory/skill review — runs AFTER the response is delivered
-        # so it never competes with the user's task for model attention.
+        # 后台内存/技能审查 — 在响应交付后运行，
+        # 因此它永远不会与用户的任务竞争模型注意力。
         if final_response and not interrupted and (_should_review_memory or _should_review_skills):
             try:
                 self._spawn_background_review(
@@ -11824,18 +11823,18 @@ class AIAgent:
                     review_skills=_should_review_skills,
                 )
             except Exception:
-                pass  # Background review is best-effort
+                pass  # 后台审查是尽力而为的
 
-        # Note: Memory provider on_session_end() + shutdown_all() are NOT
-        # called here — run_conversation() is called once per user message in
-        # multi-turn sessions. Shutting down after every turn would kill the
-        # provider before the second message. Actual session-end cleanup is
-        # handled by the CLI (atexit / /reset) and gateway (session expiry /
-        # _reset_session).
+        # 注意：内存提供商的 on_session_end() + shutdown_all() 在这里
+        # 不调用 — run_conversation() 在多回合会话中每条用户消息调用一次。
+        # 每回合后关闭会在第二条消息之前杀死
+        # 提供商。实际的会话结束清理
+        # 由 CLI（atexit / /reset）和网关（会话过期 /
+        # _reset_session）处理。
 
-        # Plugin hook: on_session_end
-        # Fired at the very end of every run_conversation call.
-        # Plugins can use this for cleanup, flushing buffers, etc.
+        # 插件钩子：on_session_end
+        # 在每次 run_conversation 调用的最末尾触发。
+        # 插件可以使用此钩子进行清理、刷新缓冲区等。
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -11853,14 +11852,14 @@ class AIAgent:
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
-        Simple chat interface that returns just the final response.
+        简单的聊天界面，仅返回最终响应。
 
         Args:
-            message (str): User message
-            stream_callback: Optional callback invoked with each text delta during streaming.
+            message (str): 用户消息
+            stream_callback: 在流式传输期间为每个文本增量调用的可选回调。
 
         Returns:
-            str: Final assistant response
+            str: 最终助手响应
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
@@ -11881,31 +11880,31 @@ def main(
     log_prefix_chars: int = 20
 ):
     """
-    Main function for running the agent directly.
+    直接运行代理的主函数。
 
     Args:
-        query (str): Natural language query for the agent. Defaults to Python 3.13 example.
-        model (str): Model name to use (OpenRouter format: provider/model). Defaults to anthropic/claude-sonnet-4.6.
-        api_key (str): API key for authentication. Uses OPENROUTER_API_KEY env var if not provided.
-        base_url (str): Base URL for the model API. Defaults to https://openrouter.ai/api/v1
-        max_turns (int): Maximum number of API call iterations. Defaults to 10.
-        enabled_toolsets (str): Comma-separated list of toolsets to enable. Supports predefined
-                              toolsets (e.g., "research", "development", "safe").
-                              Multiple toolsets can be combined: "web,vision"
-        disabled_toolsets (str): Comma-separated list of toolsets to disable (e.g., "terminal")
-        list_tools (bool): Just list available tools and exit
-        save_trajectories (bool): Save conversation trajectories to JSONL files (appends to trajectory_samples.jsonl). Defaults to False.
-        save_sample (bool): Save a single trajectory sample to a UUID-named JSONL file for inspection. Defaults to False.
-        verbose (bool): Enable verbose logging for debugging. Defaults to False.
-        log_prefix_chars (int): Number of characters to show in log previews for tool calls/responses. Defaults to 20.
+        query (str): 代理的自然语言查询。默认为 Python 3.13 示例。
+        model (str): 要使用的模型名称（OpenRouter 格式：provider/model）。默认为 anthropic/claude-sonnet-4.6。
+        api_key (str): 身份验证的 API 密钥。如果未提供则使用 OPENROUTER_API_KEY 环境变量。
+        base_url (str): 模型 API 的基本 URL。默认为 https://openrouter.ai/api/v1
+        max_turns (int): API 调用迭代的最大次数。默认为 10。
+        enabled_toolsets (str): 要启用的工具集的逗号分隔列表。支持预定义
+                              工具集（例如 "research"、"development"、"safe"）。
+                              可以组合多个工具集："web,vision"
+        disabled_toolsets (str): 要禁用的工具集的逗号分隔列表（例如 "terminal"）
+        list_tools (bool): 仅列出可用工具并退出
+        save_trajectories (bool): 将对话轨迹保存到 JSONL 文件（附加到 trajectory_samples.jsonl）。默认为 False。
+        save_sample (bool): 将单个轨迹样本保存到 UUID 命名的 JSONL 文件以供检查。默认为 False。
+        verbose (bool): 启用详细日志记录以进行调试。默认为 False。
+        log_prefix_chars (int): 在工具调用/响应的日志预览中显示的字符数。默认为 20。
 
-    Toolset Examples:
-        - "research": Web search, extract, crawl + vision tools
+    工具集示例：
+        - "research": Web 搜索、提取、爬取 + 视觉工具
     """
     print("🤖 AI Agent with Tool Calling")
     print("=" * 50)
     
-    # Handle tool listing
+    # 处理工具列表
     if list_tools:
         from model_tools import get_all_tool_names, get_toolset_for_tool, get_available_toolsets
         from toolsets import get_all_toolsets, get_toolset_info
@@ -11913,12 +11912,12 @@ def main(
         print("📋 Available Tools & Toolsets:")
         print("-" * 50)
         
-        # Show new toolsets system
+        # 显示新工具集系统
         print("\n🎯 Predefined Toolsets (New System):")
         print("-" * 40)
         all_toolsets = get_all_toolsets()
         
-        # Group by category
+        # 按类别分组
         basic_toolsets = []
         composite_toolsets = []
         scenario_toolsets = []
@@ -11934,14 +11933,14 @@ def main(
                 else:
                     scenario_toolsets.append(entry)
         
-        # Print basic toolsets
+        # 打印基本工具集
         print("\n📌 Basic Toolsets:")
         for name, info in basic_toolsets:
             tools_str = ', '.join(info['resolved_tools']) if info['resolved_tools'] else 'none'
             print(f"  • {name:15} - {info['description']}")
             print(f"    Tools: {tools_str}")
         
-        # Print composite toolsets
+        # 打印复合工具集
         print("\n📂 Composite Toolsets (built from other toolsets):")
         for name, info in composite_toolsets:
             includes_str = ', '.join(info['includes']) if info['includes'] else 'none'
@@ -11949,14 +11948,14 @@ def main(
             print(f"    Includes: {includes_str}")
             print(f"    Total tools: {info['tool_count']}")
         
-        # Print scenario-specific toolsets
+        # 打印场景特定工具集
         print("\n🎭 Scenario-Specific Toolsets:")
         for name, info in scenario_toolsets:
             print(f"  • {name:20} - {info['description']}")
             print(f"    Total tools: {info['tool_count']}")
         
         
-        # Show legacy toolset compatibility
+        # 显示旧版工具集兼容性
         print("\n📦 Legacy Toolsets (for backward compatibility):")
         legacy_toolsets = get_available_toolsets()
         for name, info in legacy_toolsets.items():
@@ -11965,7 +11964,7 @@ def main(
             if not info["available"]:
                 print(f"    Requirements: {', '.join(info['requirements'])}")
         
-        # Show individual tools
+        # 显示单个工具
         all_tools = get_all_tool_names()
         print(f"\n🔧 Individual Tools ({len(all_tools)} available):")
         for tool_name in sorted(all_tools):
@@ -11988,7 +11987,7 @@ def main(
         print("  python run_agent.py --save_trajectories --query='your question here'")
         return
     
-    # Parse toolset selection arguments
+    # 解析工具集选择参数
     enabled_toolsets_list = None
     disabled_toolsets_list = None
     
@@ -12005,7 +12004,7 @@ def main(
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
     
-    # Initialize agent with provided parameters
+    # 使用提供的参数初始化代理
     try:
         agent = AIAgent(
             base_url=base_url,
@@ -12022,7 +12021,7 @@ def main(
         print(f"❌ Failed to initialize agent: {e}")
         return
     
-    # Use provided query or default to Python 3.13 example
+    # 使用提供的查询或默认为 Python 3.13 示例
     if query is None:
         user_query = (
             "Tell me about the latest developments in Python 3.13 and what new features "
@@ -12034,7 +12033,7 @@ def main(
     print(f"\n📝 User Query: {user_query}")
     print("\n" + "=" * 50)
     
-    # Run conversation
+    # 运行对话
     result = agent.run_conversation(user_query)
     
     print("\n" + "=" * 50)
@@ -12049,12 +12048,12 @@ def main(
         print("-" * 30)
         print(result['final_response'])
     
-    # Save sample trajectory to UUID-named file if requested
+    # 如果请求，将样本轨迹保存到 UUID 命名的文件
     if save_sample:
         sample_id = str(uuid.uuid4())[:8]
         sample_filename = f"sample_{sample_id}.json"
         
-        # Convert messages to trajectory format (same as batch_runner)
+        # 将消息转换为轨迹格式（与 batch_runner 相同）
         trajectory = agent._convert_to_trajectory_format(
             result['messages'], 
             user_query, 
@@ -12071,7 +12070,7 @@ def main(
         
         try:
             with open(sample_filename, "w", encoding="utf-8") as f:
-                # Pretty-print JSON with indent for readability
+                # 使用缩进漂亮打印 JSON 以提高可读性
                 f.write(json.dumps(entry, ensure_ascii=False, indent=2))
             print(f"\n💾 Sample trajectory saved to: {sample_filename}")
         except Exception as e:
