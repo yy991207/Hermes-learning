@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -109,6 +109,35 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
+"""
+
+
+# Chat 流式接口（/api/chat/stream + /api/chat/resume）需要的两张表
+# - message_streams：一次"用户问 -> 助手答"的元信息和最终状态
+# - message_chunks ：按 seq 自增切片存 token 增量，支持按 last_seq 断点续传
+STREAM_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS message_streams (
+    message_id  TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    user_input  TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    final_text  TEXT,
+    error       TEXT,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS message_chunks (
+    message_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    delta       TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'token',
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (message_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_chunks_msg
+    ON message_chunks(message_id, seq);
 """
 
 
@@ -329,6 +358,19 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7：新增 Chat 流式接口需要的两张表
+                # message_streams：记录一次"问->答"流的元信息和最终状态
+                # message_chunks：按 seq 切片存 token 增量，支持断点续传（resume）
+                cursor.executescript(STREAM_SCHEMA_SQL)
+                cursor.execute("UPDATE schema_version SET version = 7")
+
+        # 兜底：即使 schema_version 已经是 >=7，也确保两张表存在
+        # （便于老库直接跳到最新版而不通过迁移路径时也能创建）
+        try:
+            cursor.executescript(STREAM_SCHEMA_SQL)
+        except sqlite3.OperationalError:
+            pass
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -862,6 +904,106 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    # =========================================================================
+    # Chat 流式接口（SSE + 断点续传）相关
+    # 设计要点：
+    #   - message_streams 表存"一次回答"的元信息和终态；
+    #   - message_chunks  按 (message_id, seq) 主键存每个 token 切片；
+    #   - 所有写操作走 _execute_write，复用已有的 BEGIN IMMEDIATE + 重试机制；
+    #   - 读 get_chunks_after 用纯 SELECT，不会和写互锁太久。
+    # =========================================================================
+
+    def create_message_stream(
+        self,
+        message_id: str,
+        session_id: str,
+        user_input: str,
+    ) -> None:
+        """登记一次新的流式回答。状态从 running 开始。"""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO message_streams
+                   (message_id, session_id, user_input, status,
+                    final_text, error, created_at, updated_at)
+                   VALUES (?, ?, ?, 'running', NULL, NULL, ?, ?)""",
+                (message_id, session_id, user_input, now, now),
+            )
+
+        self._execute_write(_do)
+
+    def append_message_chunk(
+        self,
+        message_id: str,
+        seq: int,
+        delta: str,
+        kind: str = "token",
+    ) -> None:
+        """追加一个 token 切片。重复 seq 直接忽略（幂等）。"""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO message_chunks
+                   (message_id, seq, delta, kind, created_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (message_id, seq, delta, kind, now),
+            )
+            conn.execute(
+                "UPDATE message_streams SET updated_at = ? WHERE message_id = ?",
+                (now, message_id),
+            )
+
+        self._execute_write(_do)
+
+    def finish_message_stream(
+        self,
+        message_id: str,
+        status: str,
+        final_text: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """收尾：把流标记为 done/error/aborted。"""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE message_streams
+                   SET status = ?, final_text = ?, error = ?, updated_at = ?
+                   WHERE message_id = ?""",
+                (status, final_text, error, now, message_id),
+            )
+
+        self._execute_write(_do)
+
+    def get_message_stream(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """读流元信息。找不到返回 None。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM message_streams WHERE message_id = ?",
+                (message_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            return dict(row)
+
+    def get_chunks_after(
+        self,
+        message_id: str,
+        last_seq: int,
+    ) -> List[Tuple[int, str, str]]:
+        """读 seq > last_seq 的所有切片，按 seq 升序返回。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT seq, delta, kind FROM message_chunks
+                   WHERE message_id = ? AND seq > ?
+                   ORDER BY seq ASC""",
+                (message_id, last_seq),
+            )
+            return [(r["seq"], r["delta"], r["kind"]) for r in cursor.fetchall()]
 
     def get_messages(self, session_id: str) -> List[Dict[str, Any]]:
         """Load all messages for a session, ordered by timestamp."""

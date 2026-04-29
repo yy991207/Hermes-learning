@@ -48,7 +48,7 @@ from hermes_cli.config import (
 from gateway.status import get_running_pid, read_runtime_status
 
 try:
-    from fastapi import FastAPI, HTTPException, Request
+    from fastapi import FastAPI, Header, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -2280,12 +2280,28 @@ def _mount_plugin_api_routes():
 # Mount plugin API routes before the SPA catch-all.
 _mount_plugin_api_routes()
 
-mount_spa(app)
+# 注意：mount_spa 包含一个 catch-all GET 路由 `/{full_path:path}`，会吞掉所有
+# 未匹配到具体路径的 GET 请求（用于 SPA 客户端路由）。所以下面的 chat 路由
+# 必须在 mount_spa 之前注册，否则 GET /api/chat/resume 会被当成 SPA 路由。
 
 
 # ---------------------------------------------------------------------------
-# Chat endpoint — conversational AI via the hermes agent
+# Chat endpoint —— SSE 流式 + 强接续（断点续传）
+#
+# 设计要点（详细背景见 chat_api.py 的注释和 doc/工作记录-2026年0429.md）：
+#   1) /api/chat/stream  POST：SSE 推 token，第一帧 meta 带 message_id；
+#   2) /api/chat/resume  GET ：按 last_seq 或 Last-Event-ID 续传；
+#   3) 同 session 一把 asyncio.Lock 互斥，避免 AIAgent 内部状态竞态；
+#   4) stream_delta_callback 在 to_thread 工作线程里被调，必须用
+#      loop.call_soon_threadsafe 把数据投回主 loop；
+#   5) 老的同步 /api/chat 已移除（前端已改造为 SharedWorker + SSE）。
 # ---------------------------------------------------------------------------
+
+import itertools  # noqa: E402
+import uuid  # noqa: E402
+from typing import AsyncGenerator, Tuple  # noqa: E402
+
+from fastapi.responses import StreamingResponse  # noqa: E402
 
 from run_agent import AIAgent  # noqa: E402
 from hermes_state import SessionDB  # noqa: E402
@@ -2294,50 +2310,229 @@ _chat_agent: "Optional[AIAgent]" = None
 _chat_session_id: "Optional[str]" = None
 _chat_session_db: "Optional[SessionDB]" = None
 
+# 每个 session 一把异步锁
+_chat_session_locks: Dict[str, asyncio.Lock] = {}
 
-class ChatRequest(BaseModel):
+# Resume 轮询间隔
+_CHAT_RESUME_POLL_INTERVAL = 0.2
+
+
+class ChatStreamRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    # 前端可预生成 message_id；不传则后端 uuid4，方便失败时 resume
+    message_id: Optional[str] = None
 
 
-class ChatResponse(BaseModel):
-    response: str
-    session_id: str
-
-
-def _get_chat_agent(session_id: Optional[str] = None) -> tuple:
-    global _chat_agent, _chat_session_id, _chat_session_db
-
+def _chat_get_db() -> SessionDB:
+    global _chat_session_db
     if _chat_session_db is None:
         _chat_session_db = SessionDB()
+    return _chat_session_db
 
+
+def _chat_get_session_lock(session_id: str) -> asyncio.Lock:
+    lock = _chat_session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _chat_session_locks[session_id] = lock
+    return lock
+
+
+def _chat_get_agent(session_id: Optional[str] = None) -> Tuple[AIAgent, str]:
+    global _chat_agent, _chat_session_id
+    _chat_get_db()  # 确保 db 初始化
     if _chat_agent is None or session_id != _chat_session_id:
         config = load_config()
         _chat_agent = AIAgent(
             model=config.get("model", {}).get("default", "deepseek-v4-pro"),
             session_id=session_id,
             save_trajectories=True,
-            session_db=_chat_session_db,
+            session_db=_chat_get_db(),
         )
         _chat_session_id = _chat_agent.session_id
     return _chat_agent, _chat_session_id
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest):
-    """Send a message to the hermes agent and get a response."""
+def _sse_pack(event: str, data: dict, seq: Optional[int] = None) -> str:
+    """组装 SSE 帧。带 id 时浏览器会自动写入 Last-Event-ID。"""
+    head = f"id: {seq}\n" if seq is not None else ""
+    return f"{head}event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+async def _chat_run_stream(
+    user_message: str,
+    session_id_in: Optional[str],
+    message_id: str,
+) -> AsyncGenerator[str, None]:
+    """流式驱动 AIAgent，把 token 逐帧 yield 出去。"""
+    db = _chat_get_db()
+    agent, sid = _chat_get_agent(session_id_in)
+
+    # 登记本次流（status=running）
+    db.create_message_stream(message_id, sid, user_message)
+
+    # 第一帧：把 message_id / session_id 告诉前端
+    yield _sse_pack("meta", {"message_id": message_id, "session_id": sid})
+
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    seq_counter = itertools.count()
+
+    # 同步回调 -> 异步队列：必须 call_soon_threadsafe，遵守事件循环绑定规则
+    def _on_delta(text):
+        if not text:
+            return
+        s = next(seq_counter)
+        loop.call_soon_threadsafe(queue.put_nowait, ("token", s, text))
+
+    prev_cb = getattr(agent, "stream_delta_callback", None)
+    agent.stream_delta_callback = _on_delta
+
+    async def _persist_chunk(s: int, text: str):
+        try:
+            await asyncio.to_thread(db.append_message_chunk, message_id, s, text, "token")
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("persist chat chunk failed seq=%d: %s", s, exc)
+
+    sess_lock = _chat_get_session_lock(sid)
+    await sess_lock.acquire()  # 同 session 串行
     try:
-        agent, session_id = _get_chat_agent(req.session_id)
-        result = await asyncio.to_thread(
-            agent.run_conversation,
-            req.message,
+        agent_task = asyncio.create_task(
+            asyncio.to_thread(agent.run_conversation, user_message)
         )
-        return ChatResponse(
-            response=result.get("final_response", ""),
-            session_id=session_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            while True:
+                getter = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {getter, agent_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if getter in done:
+                    _kind, s, text = getter.result()
+                    yield _sse_pack("token", {"delta": text}, seq=s)
+                    asyncio.create_task(_persist_chunk(s, text))
+                else:
+                    getter.cancel()
+
+                if agent_task.done():
+                    # 抽干残留 token
+                    while not queue.empty():
+                        _kind, s, text = queue.get_nowait()
+                        yield _sse_pack("token", {"delta": text}, seq=s)
+                        asyncio.create_task(_persist_chunk(s, text))
+
+                    if agent_task.exception() is not None:
+                        err = repr(agent_task.exception())
+                        await asyncio.to_thread(
+                            db.finish_message_stream, message_id, "error", None, err
+                        )
+                        yield _sse_pack("error", {"error": err})
+                    else:
+                        result = agent_task.result() or {}
+                        final = result.get("final_response", "") or ""
+                        await asyncio.to_thread(
+                            db.finish_message_stream, message_id, "done", final, None
+                        )
+                        yield _sse_pack("done", {"final": final})
+                    return
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                db.finish_message_stream, message_id, "aborted", None, "client disconnected"
+            )
+            raise
+    finally:
+        agent.stream_delta_callback = prev_cb
+        sess_lock.release()
+
+
+@app.post("/api/chat/stream")
+async def chat_stream_endpoint(req: ChatStreamRequest):
+    """SSE 流式聊天入口。"""
+    message_id = req.message_id or uuid.uuid4().hex
+    return StreamingResponse(
+        _chat_run_stream(req.message, req.session_id, message_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # 关 nginx 缓冲
+            "X-Message-Id": message_id,
+        },
+    )
+
+
+async def _chat_run_resume(
+    message_id: str, last_seq: int
+) -> AsyncGenerator[str, None]:
+    db = _chat_get_db()
+    info = await asyncio.to_thread(db.get_message_stream, message_id)
+    if info is None:
+        yield _sse_pack("error", {"error": f"message_id not found: {message_id}"})
+        return
+
+    yield _sse_pack(
+        "meta",
+        {"message_id": message_id, "session_id": info["session_id"], "resume": True},
+    )
+
+    cursor = last_seq
+    chunks = await asyncio.to_thread(db.get_chunks_after, message_id, cursor)
+    for seq, delta, _kind in chunks:
+        yield _sse_pack("token", {"delta": delta}, seq=seq)
+        cursor = seq
+
+    while True:
+        info = await asyncio.to_thread(db.get_message_stream, message_id)
+        if info is None:
+            yield _sse_pack("error", {"error": "stream vanished"})
+            return
+        chunks = await asyncio.to_thread(db.get_chunks_after, message_id, cursor)
+        for seq, delta, _kind in chunks:
+            yield _sse_pack("token", {"delta": delta}, seq=seq)
+            cursor = seq
+
+        status = info["status"]
+        if status == "running":
+            await asyncio.sleep(_CHAT_RESUME_POLL_INTERVAL)
+            continue
+        if status == "done":
+            yield _sse_pack("done", {"final": info.get("final_text") or ""})
+            return
+        if status in ("error", "aborted"):
+            yield _sse_pack(
+                "error",
+                {"error": info.get("error") or f"stream {status}"},
+            )
+            return
+        yield _sse_pack("error", {"error": f"unknown status: {status}"})
+        return
+
+
+@app.get("/api/chat/resume")
+async def chat_resume_endpoint(
+    message_id: str,
+    last_seq: int = -1,
+    last_event_id: Optional[str] = Header(None, alias="Last-Event-ID"),
+):
+    """SSE 断点续传。Last-Event-ID 优先于 last_seq。"""
+    if last_event_id is not None:
+        try:
+            last_seq = int(last_event_id)
+        except ValueError:
+            pass
+    return StreamingResponse(
+        _chat_run_resume(message_id, last_seq),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# 所有具体 API 路由注册完毕，最后挂 SPA catch-all
+mount_spa(app)
 
 
 def start_server(

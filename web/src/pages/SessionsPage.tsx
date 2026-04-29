@@ -17,6 +17,7 @@ import {
 import { api } from "@/lib/api";
 import type { SessionInfo, SessionMessage, SessionSearchResult } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { getChatClient, findPendingMessage, type ChatEvent } from "@/lib/chatClient";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -328,6 +329,10 @@ export default function SessionsPage() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatSessionId, setChatSessionId] = useState<string | undefined>();
   const [activeSessionId, setActiveSessionId] = useState<string | undefined>();
+  // 当前正在流式输出的 messageId；非空表示助手气泡尾部要显示打字光标
+  const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
+  // 当前会话的最后一条助手消息索引（用于增量拼接）
+  const streamingIdxRef = useRef<number | null>(null);
 
   // 拖动调整宽度
   const [chatWidth, setChatWidth] = useState(1000);
@@ -356,6 +361,109 @@ export default function SessionsPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages]);
+
+  // 订阅 SharedWorker 推送的 chat 流事件：token 增量拼接、done/error 收尾、resume 自动续传
+  useEffect(() => {
+    const client = getChatClient();
+
+    // streamingMsgId 用 ref 跟踪一份镜像，避免在闭包里读到过期值
+    const off = client.subscribe((evt: ChatEvent) => {
+      if (evt.type === "snapshot") {
+        // 新挂载时拿快照：如果有正在跑的流，把已有文本回灌到最后一条助手气泡
+        const running = evt.streams.find((s) => s.status === "running");
+        if (running) {
+          setStreamingMsgId(running.messageId);
+          setChatLoading(true);
+          if (running.sessionId) {
+            setChatSessionId(running.sessionId);
+            setActiveSessionId(running.sessionId);
+          }
+          setChatMessages((prev) => {
+            // 找最后一条 assistant；没有就追加一条
+            let idx = -1;
+            for (let i = prev.length - 1; i >= 0; i--) {
+              if (prev[i].role === "assistant") { idx = i; break; }
+            }
+            const copy = [...prev];
+            if (idx === -1) {
+              copy.push({ role: "assistant", content: running.text });
+              streamingIdxRef.current = copy.length - 1;
+            } else {
+              copy[idx] = { role: "assistant", content: running.text };
+              streamingIdxRef.current = idx;
+            }
+            return copy;
+          });
+        }
+        return;
+      }
+
+      if (evt.type === "meta") {
+        if (evt.sessionId) {
+          setChatSessionId(evt.sessionId);
+          setActiveSessionId(evt.sessionId);
+        }
+        return;
+      }
+
+      if (evt.type === "token") {
+        setChatMessages((prev) => {
+          const idx = streamingIdxRef.current;
+          if (idx == null || idx >= prev.length) return prev;
+          const copy = [...prev];
+          copy[idx] = { role: "assistant", content: copy[idx].content + evt.delta };
+          return copy;
+        });
+        return;
+      }
+
+      if (evt.type === "done") {
+        // 用最终文本兜底覆盖一遍（防止漏 token）
+        setChatMessages((prev) => {
+          const idx = streamingIdxRef.current;
+          if (idx == null || idx >= prev.length) return prev;
+          const copy = [...prev];
+          if (evt.final && evt.final.length >= copy[idx].content.length) {
+            copy[idx] = { role: "assistant", content: evt.final };
+          }
+          return copy;
+        });
+        setChatLoading(false);
+        setStreamingMsgId(null);
+        streamingIdxRef.current = null;
+        loadSessions(page);
+        return;
+      }
+
+      if (evt.type === "error") {
+        setChatMessages((prev) => {
+          const idx = streamingIdxRef.current;
+          const errText = "Error: " + evt.error;
+          if (idx == null || idx >= prev.length) return [...prev, { role: "assistant", content: errText }];
+          const copy = [...prev];
+          copy[idx] = { role: "assistant", content: copy[idx].content + "\n\n" + errText };
+          return copy;
+        });
+        setChatLoading(false);
+        setStreamingMsgId(null);
+        streamingIdxRef.current = null;
+      }
+    });
+
+    // 挂载时：检查 IndexedDB 里有没有"上次没跑完的 messageId"，自动 resume
+    findPendingMessage().then((pending) => {
+      if (pending) {
+        setStreamingMsgId(pending.messageId);
+        setChatLoading(true);
+        client.resume({ messageId: pending.messageId, lastSeq: pending.lastSeq });
+      }
+    });
+
+    return () => {
+      off();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Debounced FTS search
   useEffect(() => {
@@ -395,30 +503,40 @@ export default function SessionsPage() {
   const sendChatMessage = async () => {
     if (!chatInput.trim() || chatLoading) return;
     const userMsg = { role: "user" as const, content: chatInput };
-    setChatMessages((prev) => [...prev, userMsg]);
+    // 同时插入：用户消息 + 一个空的助手气泡（用于实时拼接 token）
+    setChatMessages((prev) => {
+      const next = [...prev, userMsg, { role: "assistant" as const, content: "" }];
+      streamingIdxRef.current = next.length - 1;
+      return next;
+    });
     const msgContent = chatInput;
     setChatInput("");
     setChatLoading(true);
+
+    // 预生成 messageId，便于服务端写库时携带（也方便失败后 resume）
+    const messageId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID().replace(/-/g, "")
+        : Math.random().toString(36).slice(2) + Date.now().toString(36);
+    setStreamingMsgId(messageId);
+
     try {
-      const token = window.__HERMES_SESSION_TOKEN__;
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ message: msgContent, session_id: chatSessionId }),
+      const client = getChatClient();
+      client.send({
+        message: msgContent,
+        sessionId: chatSessionId,
+        messageId,
       });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      setChatMessages((prev) => [...prev, { role: "assistant", content: data.response }]);
-      setChatSessionId(data.session_id);
-      setActiveSessionId(data.session_id);
-      // 发送完成后自动刷新左侧会话列表
-      loadSessions(page);
     } catch (err) {
-      setChatMessages((prev) => [...prev, { role: "assistant", content: "Error: " + err }]);
-    } finally {
+      setChatMessages((prev) => {
+        const idx = streamingIdxRef.current;
+        if (idx == null) return [...prev, { role: "assistant", content: "Error: " + err }];
+        const copy = [...prev];
+        copy[idx] = { role: "assistant", content: "Error: " + err };
+        return copy;
+      });
       setChatLoading(false);
+      setStreamingMsgId(null);
     }
   };
 
@@ -626,10 +744,22 @@ export default function SessionsPage() {
             }}
           >
             <Flex vertical gap={12}>
-              {chatMessages.map((msg, i) => (
-                <ChatBubble key={i} role={msg.role} content={msg.content} />
-              ))}
-              {chatLoading && (
+              {chatMessages.map((msg, i) => {
+                // 流式中的最后一条助手气泡末尾追加一个细光标
+                const isStreamingTail =
+                  streamingMsgId !== null &&
+                  msg.role === "assistant" &&
+                  i === streamingIdxRef.current;
+                const display = isStreamingTail ? msg.content + "▍" : msg.content;
+                return (
+                  <ChatBubble
+                    key={i}
+                    role={msg.role}
+                    content={display}
+                  />
+                );
+              })}
+              {chatLoading && streamingMsgId === null && (
                 <Flex justify="center">
                   <Spin size="small" />
                 </Flex>
