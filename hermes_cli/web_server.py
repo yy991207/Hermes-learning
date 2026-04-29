@@ -2283,6 +2283,63 @@ _mount_plugin_api_routes()
 mount_spa(app)
 
 
+# ---------------------------------------------------------------------------
+# Chat endpoint — conversational AI via the hermes agent
+# ---------------------------------------------------------------------------
+
+from run_agent import AIAgent  # noqa: E402
+from hermes_state import SessionDB  # noqa: E402
+
+_chat_agent: "Optional[AIAgent]" = None
+_chat_session_id: "Optional[str]" = None
+_chat_session_db: "Optional[SessionDB]" = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+
+
+def _get_chat_agent(session_id: Optional[str] = None) -> tuple:
+    global _chat_agent, _chat_session_id, _chat_session_db
+
+    if _chat_session_db is None:
+        _chat_session_db = SessionDB()
+
+    if _chat_agent is None or session_id != _chat_session_id:
+        config = load_config()
+        _chat_agent = AIAgent(
+            model=config.get("model", {}).get("default", "deepseek-v4-pro"),
+            session_id=session_id,
+            save_trajectories=True,
+            session_db=_chat_session_db,
+        )
+        _chat_session_id = _chat_agent.session_id
+    return _chat_agent, _chat_session_id
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest):
+    """Send a message to the hermes agent and get a response."""
+    try:
+        agent, session_id = _get_chat_agent(req.session_id)
+        result = await asyncio.to_thread(
+            agent.run_conversation,
+            req.message,
+        )
+        return ChatResponse(
+            response=result.get("final_response", ""),
+            session_id=session_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def start_server(
     host: str = "127.0.0.1",
     port: int = 9119,
@@ -2291,6 +2348,11 @@ def start_server(
 ):
     """Start the web UI server."""
     import uvicorn
+
+    # Write session token so dev tooling can read it
+    _TOKEN_PATH = PROJECT_ROOT / ".server.token"
+    _TOKEN_PATH.write_text(_SESSION_TOKEN)
+    _log.info("Session token written to %s", _TOKEN_PATH)
 
     _LOCALHOST = ("127.0.0.1", "localhost", "::1")
     if host not in _LOCALHOST and not allow_public:

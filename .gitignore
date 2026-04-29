@@ -63,3 +63,19 @@ mini-swe-agent/
 .nix-stamps/
 result
 website/static/api/skills-index.json
+.playwright-mcp/
+
+# Server runtime files
+.server.*
+
+# User documentation (non-core)
+/doc/
+
+# Log files
+*.log
+
+# Trajectory samples (non-core data)
+trajectory_samples.jsonl
+
+# Standalone chat API (now integrated into web_server.py)
+chat_api.py

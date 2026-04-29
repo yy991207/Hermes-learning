@@ -11573,9 +11573,9 @@ class AIAgent:
 
                     codex_ack_continuations = 0
 
-                        final_response = truncated_response_prefix + final_response
-                        truncated_response_prefix = ""
-                        length_continue_retries = 0
+                    final_response = truncated_response_prefix + final_response
+                    truncated_response_prefix = ""
+                    length_continue_retries = 0
                     
                     # 从面向用户的响应中剥离 <think> 块（在消息中为轨迹保留原始）
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
