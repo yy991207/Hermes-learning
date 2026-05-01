@@ -67,7 +67,7 @@ website/static/api/skills-index.json
 
 # Server runtime files
 .server.*
-
+config.yaml
 # User documentation (non-core)
 /doc/
 

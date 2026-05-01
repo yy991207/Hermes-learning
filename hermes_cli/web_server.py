@@ -2531,6 +2531,533 @@ async def chat_resume_endpoint(
     )
 
 
+# ---------------------------------------------------------------------------
+# Voice WebSocket endpoint —— VAD 驱动的实时语音对话
+#
+# 协议（JSON 文本帧）:
+#   客户端 → 服务端:
+#     {"type": "voice_start"}          进入语音模式，开始持续推送 PCM
+#     {"type": "voice_stop"}           退出语音模式
+#
+#   服务端 → 客户端:
+#     {"type": "status", "status": "listening|thinking|speaking|idle|error"}
+#     {"type": "vad", "status": "speech_start|speech_end"}
+#     {"type": "transcription", "text": "…"}  STT 转写结果
+#     {"type": "token", "delta": "…"}        文本增量
+#     {"type": "done", "final": "…"}         回复完成
+#     {"type": "interrupted"}                被打断通知
+#     {"type": "error", "error": "…"}        错误
+#
+# 二进制帧:
+#   客户端 → 服务端: PCM 音频数据（16kHz, 16bit, mono）
+#   服务端 → 客户端: TTS 音频数据（MP3 bytes）
+#
+# 状态机: LISTENING → THINKING → SPEAKING → LISTENING（循环）
+#   - VAD 检测到人声结束 → 触发 STT + Agent + TTS
+#   - SPEAKING 期间检测到新人声 → 打断，回到 LISTENING
+#
+# 设计原则:
+#   - 音频不做任何持久存储，临时文件用完即删
+#   - 复用现有 AIAgent 和 stream_delta_callback 机制
+#   - VAD 引擎在服务端运行（silero-vad），前端只负责 PCM 采集
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+import json as _json
+import os as _os
+import queue as _queue
+import tempfile as _tempfile
+import threading as _threading
+import uuid as _uuid
+
+from fastapi import WebSocket as _WebSocket, WebSocketDisconnect as _WebSocketDisconnect
+
+# silero-vad 要求的帧长：512 samples @ 16kHz = 32ms = 1024 bytes
+_VAD_FRAME_SAMPLES = 512
+_VAD_FRAME_BYTES = _VAD_FRAME_SAMPLES * 2  # 16bit = 2 bytes/sample
+
+# 前端发送的帧长：320 samples @ 16kHz = 20ms = 640 bytes
+_PCM_CHUNK_BYTES = 640
+
+# 语音段最短/最长限制
+_MIN_SPEECH_BYTES = 16000   # 0.5 秒
+_MAX_SPEECH_BYTES = 480000  # 15 秒
+_MIN_SPEECH_RMS = 350       # 低于该 RMS 认为是底噪/误触发
+
+# TTS 每积累多少字触发一次
+_TTS_CHUNK_SIZE = 80
+
+_VOICE_SESSIONS: Dict[str, dict] = {}
+"""session_id → {
+    'vad_engine': VADEngine,
+    'pcm_buffer': bytearray,     # 累积 PCM 直到凑够 VAD 帧长
+    'speech_audio': bytearray,   # 当前语音段的 PCM 数据
+    'agent_task': asyncio.Task | None,
+    'interrupt_event': threading.Event | None,
+    'state': 'idle' | 'listening' | 'thinking' | 'speaking',
+}"""
+
+
+@app.websocket("/api/voice/ws")
+async def voice_websocket_endpoint(ws: _WebSocket):
+    """WebSocket VAD 驱动的实时语音对话端点。
+
+    客户端连接后发送 voice_start 进入语音模式，
+    然后持续推送 PCM 音频帧。服务端用 silero-vad 检测人声边界，
+    人声结束后自动触发 STT → Agent → TTS 全链路。
+    """
+    await ws.accept()
+    session_id = _uuid.uuid4().hex
+    _log.info("[voice] WebSocket 连接建立 session=%s", session_id)
+
+    # ---- 辅助函数 ----
+
+    async def _send_json(data: dict):
+        try:
+            await ws.send_text(_json.dumps(data, ensure_ascii=False))
+        except Exception:
+            pass
+
+    async def _send_audio(audio_bytes: bytes):
+        try:
+            _log.info("[voice] send audio bytes=%d", len(audio_bytes))
+            await ws.send_bytes(audio_bytes)
+        except Exception as e:
+            _log.warning("[voice] send audio failed: %s", e)
+
+    async def _set_status(status: str):
+        await _send_json({"type": "status", "status": status})
+
+    def _run_stt(pcm_bytes: bytes) -> dict:
+        """在 to_thread 中执行 STT。
+
+        统一复用项目现有 STT 分发链路，让 web 语音跟随当前配置：
+        当前环境下会走本地 faster-whisper，避免阿里云 404 和无效 OpenAI key 401。
+        """
+        from tools.aliyun_voice import pcm_to_wav
+        from tools.transcription_tools import transcribe_audio
+
+        wav_bytes = pcm_to_wav(pcm_bytes)
+        tmp_path = None
+        try:
+            tmp = _tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.write(wav_bytes)
+            tmp.close()
+            tmp_path = tmp.name
+            return transcribe_audio(tmp_path)
+        finally:
+            if tmp_path:
+                try:
+                    _os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _run_tts(text: str) -> dict:
+        """在 to_thread 中执行 TTS。
+
+        优先走本地已安装的 edge-tts，避免当前阿里云 TTS 404。
+        """
+        tts_text = (text or "").strip()
+        if not tts_text:
+            return {"success": False, "error": "TTS 文字为空"}
+
+        _log.info("[voice] TTS start chars=%d preview=%r", len(tts_text), tts_text[:40])
+
+        try:
+            import edge_tts
+
+            # 中英文本做一个简单的默认 voice 选择
+            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in tts_text)
+            voice = "zh-CN-XiaoxiaoNeural" if has_cjk else "en-US-AriaNeural"
+
+            tmp = _tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+
+            async def _generate():
+                communicate = edge_tts.Communicate(tts_text, voice=voice)
+                await communicate.save(tmp_path)
+
+            _asyncio.run(_generate())
+            with open(tmp_path, "rb") as f:
+                audio_data = f.read()
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+            _log.info("[voice] TTS edge success voice=%s bytes=%d", voice, len(audio_data))
+            return {"success": True, "audio_data": audio_data, "format": "mp3"}
+        except Exception as e:
+            _log.warning("[voice] TTS edge failed: %s", e)
+            from tools.aliyun_voice import aliyun_tts
+            result = aliyun_tts(text)
+            if result.get("success"):
+                _log.info("[voice] TTS aliyun success bytes=%d", len(result.get("audio_data", b"")))
+            else:
+                _log.warning("[voice] TTS aliyun failed: %s", result.get("error"))
+            return result
+
+    def _run_agent_sync(
+        user_text: str,
+        sid: str,
+        delta_queue: _queue.Queue,
+        interrupt_event: _threading.Event,
+    ) -> dict:
+        """在 to_thread 中运行 AIAgent，通过 delta_queue 推送 token。"""
+        from run_agent import AIAgent
+        from hermes_state import SessionDB
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        db = SessionDB()
+        agent = AIAgent(
+            model=config.get("model", {}).get("default", "deepseek-v4-pro"),
+            session_id=sid,
+            save_trajectories=False,
+            session_db=db,
+        )
+
+        def _on_delta(text: str):
+            if text:
+                delta_queue.put(("token", text))
+
+        agent.stream_delta_callback = _on_delta
+
+        result = {}
+        error = None
+
+        def _run():
+            nonlocal result, error
+            try:
+                result = agent.run_conversation(user_text)
+            except Exception as e:
+                error = str(e)
+
+        thread = _threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+        while thread.is_alive():
+            thread.join(timeout=0.1)
+            if interrupt_event.is_set():
+                try:
+                    agent.interrupt("voice user interrupt")
+                except Exception:
+                    pass
+                thread.join(timeout=5)
+                delta_queue.put(("interrupted", ""))
+                return {"final_response": "", "interrupted": True}
+
+        if error:
+            delta_queue.put(("error", error))
+            return {"final_response": "", "error": error}
+
+        return result
+
+    async def _handle_speech_end(session_data: dict):
+        """人声结束：触发 STT → Agent → TTS 全链路。"""
+        speech_audio = bytes(session_data["speech_audio"])
+        session_data["speech_audio"] = bytearray()
+
+        # 检查语音段长度
+        if len(speech_audio) < _MIN_SPEECH_BYTES:
+            _log.debug("[voice] 语音段太短 (%d bytes)，丢弃", len(speech_audio))
+            session_data["state"] = "listening"
+            return
+
+        if len(speech_audio) > _MAX_SPEECH_BYTES:
+            _log.debug("[voice] 语音段过长 (%d bytes)，截断", len(speech_audio))
+            speech_audio = speech_audio[:_MAX_SPEECH_BYTES]
+
+        # 误触发过滤：低能量底噪不送 STT
+        if speech_audio:
+            import numpy as _np
+            _samples = _np.frombuffer(speech_audio, dtype=_np.int16).astype(_np.float32)
+            speech_rms = int(_np.sqrt(_np.mean(_samples * _samples))) if len(_samples) else 0
+        else:
+            speech_rms = 0
+        if speech_rms < _MIN_SPEECH_RMS:
+            _log.info("[voice] 忽略低能量语音段: rms=%d, bytes=%d", speech_rms, len(speech_audio))
+            session_data["state"] = "listening"
+            return
+
+        # 第一步：STT 转写
+        session_data["state"] = "thinking"
+        await _set_status("thinking")
+        stt_result = await _asyncio.to_thread(_run_stt, speech_audio)
+
+        if not stt_result.get("success"):
+            await _send_json({
+                "type": "error",
+                "error": f"语音识别失败: {stt_result.get('error', '未知错误')}"
+            })
+            session_data["state"] = "listening"
+            await _set_status("listening")
+            return
+
+        transcript = (stt_result.get("transcript") or "").strip()
+
+        # 过滤空转写 / 静音幻觉
+        from tools.voice_mode import is_whisper_hallucination
+        if not transcript or is_whisper_hallucination(transcript):
+            _log.info("[voice] 忽略空转写/静音幻觉: %r", transcript)
+            session_data["state"] = "listening"
+            await _set_status("listening")
+            return
+
+        _log.info("[voice] STT 转写结果: %s", transcript)
+        await _send_json({"type": "transcription", "text": transcript})
+
+        # 第二步：运行 Agent
+        delta_queue: _queue.Queue = _queue.Queue()
+        interrupt_event = _threading.Event()
+
+        agent_task = _asyncio.create_task(
+            _asyncio.to_thread(
+                _run_agent_sync,
+                transcript,
+                session_id,
+                delta_queue,
+                interrupt_event,
+            )
+        )
+        session_data["agent_task"] = agent_task
+        session_data["interrupt_event"] = interrupt_event
+
+        # 第三步：消费 delta_queue，同时做 TTS
+        full_text = ""
+        tts_text_buffer = ""
+        terminal_event = None
+
+        async def _flush_tts():
+            nonlocal tts_text_buffer
+            if not tts_text_buffer.strip():
+                return
+            text_to_speak = tts_text_buffer.strip()
+            tts_text_buffer = ""
+            tts_result = await _asyncio.to_thread(_run_tts, text_to_speak)
+            if tts_result.get("success"):
+                await _send_audio(tts_result["audio_data"])
+
+        session_data["state"] = "speaking"
+        await _set_status("speaking")
+
+        while True:
+            # 检查是否在消费过程中被打断
+            if interrupt_event.is_set():
+                terminal_event = {"type": "interrupted"}
+                break
+
+            try:
+                item = await _asyncio.get_running_loop().run_in_executor(
+                    None, lambda: delta_queue.get(timeout=0.3)
+                )
+            except _queue.Empty:
+                if agent_task.done():
+                    # 抽干残留
+                    while True:
+                        try:
+                            item = delta_queue.get_nowait()
+                        except _queue.Empty:
+                            break
+                        if item[0] == "token":
+                            full_text += item[1]
+                            tts_text_buffer += item[1]
+                            await _send_json({"type": "token", "delta": item[1]})
+                            if len(tts_text_buffer) >= _TTS_CHUNK_SIZE:
+                                await _flush_tts()
+                        elif item[0] == "interrupted":
+                            terminal_event = {"type": "interrupted"}
+                        elif item[0] == "error":
+                            terminal_event = {"type": "error", "error": item[1]}
+                    break
+                continue
+
+            kind, value = item
+
+            if kind == "token":
+                full_text += value
+                tts_text_buffer += value
+                await _send_json({"type": "token", "delta": value})
+                if len(tts_text_buffer) >= _TTS_CHUNK_SIZE:
+                    await _flush_tts()
+
+            elif kind == "interrupted":
+                terminal_event = {"type": "interrupted"}
+                break
+
+            elif kind == "error":
+                terminal_event = {"type": "error", "error": value}
+                break
+
+        if terminal_event is None:
+            await _flush_tts()
+            await _send_json({"type": "done", "final": full_text})
+        elif terminal_event["type"] == "interrupted":
+            await _flush_tts()
+            await _send_json({"type": "interrupted"})
+        else:
+            await _flush_tts()
+            await _send_json(terminal_event)
+
+        # 清理
+        if not agent_task.done():
+            agent_task.cancel()
+        session_data["agent_task"] = None
+        session_data["interrupt_event"] = None
+
+        # 回到监听状态
+        session_data["state"] = "listening"
+        await _set_status("listening")
+
+    # ---- 主循环 ----
+
+    # 初始状态：等待 voice_start
+    await _set_status("idle")
+    session_data = None
+
+    try:
+        while True:
+            raw = await ws.receive()
+
+            # 处理二进制帧（PCM 音频数据）
+            if "bytes" in raw:
+                if session_data is None:
+                    continue  # 尚未进入语音模式，忽略
+
+                pcm_chunk = raw["bytes"]
+                # 每 50 帧记录一次，确认数据到达
+                chunk_count = session_data.get("_chunk_count", 0) + 1
+                session_data["_chunk_count"] = chunk_count
+                if chunk_count <= 3 or chunk_count % 50 == 0:
+                    _log.info("[voice] PCM chunk #%d: %d bytes, state=%s", chunk_count, len(pcm_chunk), session_data.get("state", "?"))
+                state = session_data.get("state", "idle")
+
+                # 累积 PCM 到缓冲区，凑够 VAD 帧长（512 samples = 1024 bytes）
+                pcm_buffer = session_data["pcm_buffer"]
+                pcm_buffer.extend(pcm_chunk)
+
+                while len(pcm_buffer) >= _VAD_FRAME_BYTES:
+                    # 取出一帧
+                    vad_frame = bytes(pcm_buffer[:_VAD_FRAME_BYTES])
+                    del pcm_buffer[:_VAD_FRAME_BYTES]
+
+                    # 调用 VAD 引擎（捕获异常，避免 WebSocket 断开）
+                    vad_engine = session_data["vad_engine"]
+                    try:
+                        vad_result = vad_engine.process_chunk(vad_frame)
+                    except Exception as e:
+                        _log.error("[voice] VAD process_chunk 异常: %s (frame=%d bytes)", e, len(vad_frame))
+                        continue  # 跳过此帧，不中断主循环
+
+                    if vad_result == "speech_start":
+                        _log.info("[voice] VAD: speech_start")
+                        await _send_json({"type": "vad", "status": "speech_start"})
+                        # 如果当前在 SPEAKING 状态，打断
+                        if state == "speaking":
+                            _log.info("[voice] 用户打断 AI 回复")
+                            interrupt_event = session_data.get("interrupt_event")
+                            if interrupt_event:
+                                interrupt_event.set()
+                            # 取消 agent task
+                            agent_task = session_data.get("agent_task")
+                            if agent_task and not agent_task.done():
+                                agent_task.cancel()
+                            session_data["agent_task"] = None
+                            session_data["interrupt_event"] = None
+                            # 清空旧的语音段，开始新累积
+                            session_data["speech_audio"] = bytearray()
+                        state = "listening"
+                        session_data["state"] = state
+                        await _set_status("listening")
+                        # 开始累积新语音段
+                        session_data["speech_audio"].extend(vad_frame)
+
+                    elif vad_result == "speech_continue":
+                        # 持续人声，累积音频
+                        session_data["speech_audio"].extend(vad_frame)
+
+                    elif vad_result == "speech_end":
+                        _log.info("[voice] VAD: speech_end, speech_audio=%d bytes", len(session_data["speech_audio"]))
+                        await _send_json({"type": "vad", "status": "speech_end"})
+                        # 触发处理
+                        await _handle_speech_end(session_data)
+                        state = session_data["state"]  # 可能已被 _handle_speech_end 更新
+
+                continue
+
+            # 处理文本帧（JSON 控制消息）
+            if "text" not in raw:
+                continue
+
+            try:
+                msg = _json.loads(raw["text"])
+            except _json.JSONDecodeError:
+                continue
+
+            msg_type = msg.get("type", "")
+
+            # ---- voice_start: 进入语音模式 ----
+            if msg_type == "voice_start":
+                if session_data is not None:
+                    continue  # 已经在语音模式
+
+                # 初始化 VAD 引擎
+                try:
+                    from tools.vad_engine import VADEngine
+                    vad_engine = VADEngine(silence_threshold_ms=800)
+                except Exception as e:
+                    _log.error("[voice] VAD 引擎初始化失败: %s", e)
+                    await _send_json({"type": "error", "error": f"VAD 引擎初始化失败: {e}"})
+                    continue
+
+                session_data = {
+                    "vad_engine": vad_engine,
+                    "pcm_buffer": bytearray(),
+                    "speech_audio": bytearray(),
+                    "agent_task": None,
+                    "interrupt_event": None,
+                    "state": "listening",
+                }
+                _VOICE_SESSIONS[session_id] = session_data
+                await _set_status("listening")
+                _log.info("[voice] 进入语音模式 session=%s", session_id)
+
+            # ---- voice_stop: 退出语音模式 ----
+            elif msg_type == "voice_stop":
+                if session_data is None:
+                    continue
+
+                # 取消正在运行的 agent
+                agent_task = session_data.get("agent_task")
+                if agent_task and not agent_task.done():
+                    agent_task.cancel()
+
+                # 释放 VAD 引擎
+                vad_engine = session_data.get("vad_engine")
+                if vad_engine:
+                    vad_engine.close()
+
+                session_data = None
+                _VOICE_SESSIONS.pop(session_id, None)
+                await _set_status("idle")
+                _log.info("[voice] 退出语音模式 session=%s", session_id)
+
+    except _WebSocketDisconnect:
+        _log.info("[voice] WebSocket 断开 session=%s", session_id)
+    except Exception as e:
+        _log.warning("[voice] WebSocket 异常 session=%s: %s", session_id, e)
+    finally:
+        # 清理资源
+        if session_data:
+            vad_engine = session_data.get("vad_engine")
+            if vad_engine:
+                vad_engine.close()
+            agent_task = session_data.get("agent_task")
+            if agent_task and not agent_task.done():
+                agent_task.cancel()
+        _VOICE_SESSIONS.pop(session_id, None)
+
+
 # 所有具体 API 路由注册完毕，最后挂 SPA catch-all
 mount_spa(app)
 

@@ -39,7 +39,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:9119",
+      "/api": {
+        target: "http://127.0.0.1:9119",
+        ws: true,  // 支持 WebSocket 代理
+      },
     },
   },
 });

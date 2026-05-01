@@ -13,11 +13,14 @@ import {
   Hash,
   X,
   Send,
+  Mic,
+  MicOff,
 } from "lucide-react";
 import { api } from "@/lib/api";
 import type { SessionInfo, SessionMessage, SessionSearchResult } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { getChatClient, findPendingMessage, type ChatEvent } from "@/lib/chatClient";
+import { createVoiceClient, type VoiceClient, type VoiceEvent } from "@/lib/voiceClient";
 import { Markdown } from "@/components/Markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -334,6 +337,12 @@ export default function SessionsPage() {
   // 当前会话的最后一条助手消息索引（用于增量拼接）
   const streamingIdxRef = useRef<number | null>(null);
 
+  // 语音对话状态
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [voiceStatus, setVoiceStatus] = useState<"idle" | "listening" | "thinking" | "speaking" | "error">("idle");
+  const voiceClientRef = useRef<VoiceClient | null>(null);
+  const voiceTranscriptRef = useRef<string>("");
+
   // 拖动调整宽度
   const [chatWidth, setChatWidth] = useState(1000);
   const [isDragging, setIsDragging] = useState(false);
@@ -463,6 +472,84 @@ export default function SessionsPage() {
       off();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 语音对话事件订阅
+  useEffect(() => {
+    if (!voiceMode) return;
+
+    const vc = createVoiceClient();
+    voiceClientRef.current = vc;
+
+    // 进入语音模式
+    vc.start().catch((err) => {
+      console.error("[voice] 启动语音模式失败:", err);
+      setVoiceStatus("error");
+    });
+
+    const off = vc.subscribe((evt: VoiceEvent) => {
+      if (evt.type === "status") {
+        setVoiceStatus(evt.status);
+      } else if (evt.type === "transcription") {
+        voiceTranscriptRef.current = evt.text;
+        setChatMessages((prev) => [
+          ...prev,
+          { role: "user", content: evt.text },
+          { role: "assistant", content: "" },
+        ]);
+        streamingIdxRef.current = null;
+        setChatLoading(true);
+      } else if (evt.type === "token") {
+        setChatMessages((prev) => {
+          const copy = [...prev];
+          for (let i = copy.length - 1; i >= 0; i--) {
+            if (copy[i].role === "assistant") {
+              copy[i] = { ...copy[i], content: copy[i].content + evt.delta };
+              break;
+            }
+          }
+          return copy;
+        });
+      } else if (evt.type === "done") {
+        setChatLoading(false);
+      } else if (evt.type === "interrupted") {
+        // 被打断，清空当前 assistant 气泡的残留内容
+        setChatMessages((prev) => {
+          const copy = [...prev];
+          for (let i = copy.length - 1; i >= 0; i--) {
+            if (copy[i].role === "assistant") {
+              copy[i] = { ...copy[i], content: copy[i].content + " [被打断]" };
+              break;
+            }
+          }
+          return copy;
+        });
+        setChatLoading(false);
+      } else if (evt.type === "error") {
+        setChatMessages((prev) => {
+          const copy = [...prev];
+          for (let i = copy.length - 1; i >= 0; i--) {
+            if (copy[i].role === "assistant") {
+              copy[i] = { ...copy[i], content: copy[i].content + "\n\nError: " + evt.error };
+              break;
+            }
+          }
+          return copy;
+        });
+        setChatLoading(false);
+      }
+    });
+
+    return () => {
+      off();
+      vc.close();
+      voiceClientRef.current = null;
+    };
+  }, [voiceMode]);
+
+  // 切换语音模式：点击进入/退出
+  const toggleVoiceMode = useCallback(() => {
+    setVoiceMode((prev) => !prev);
   }, []);
 
   // Debounced FTS search
@@ -777,27 +864,84 @@ export default function SessionsPage() {
               flexShrink: 0,
             }}
           >
-            <Flex gap={8}>
-              <AntInput
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                onPressEnter={sendChatMessage}
-                placeholder="Type a message..."
-                size="small"
-                style={{ flex: 1, fontSize: 12 }}
-              />
+            <Flex gap={8} align="center">
+              {/* 语音模式切换按钮 */}
               <AntButton
-                type="primary"
                 size="small"
-                icon={<Send style={{ width: 14, height: 14 }} />}
-                onClick={sendChatMessage}
-                disabled={chatLoading}
+                icon={
+                  voiceMode
+                    ? <MicOff style={{ width: 14, height: 14 }} />
+                    : <Mic style={{ width: 14, height: 14 }} />
+                }
+                onClick={toggleVoiceMode}
                 style={{
-                  background: "var(--color-primary)",
-                  borderColor: "var(--color-primary)",
-                  color: "var(--color-primary-foreground)",
+                  color: voiceMode ? "var(--color-destructive)" : "var(--color-muted-foreground)",
+                  borderColor: voiceMode ? "var(--color-destructive)" : "var(--color-border)",
                 }}
+                title={voiceMode ? "关闭语音模式" : "开启语音模式"}
               />
+
+              {voiceMode ? (
+                /* 语音模式：VAD 自动检测，无需按住 */
+                <div
+                  style={{
+                    flex: 1,
+                    fontSize: 12,
+                    padding: "4px 12px",
+                    borderRadius: 6,
+                    textAlign: "center",
+                    ...(voiceStatus === "listening"
+                      ? {
+                          background: "var(--color-destructive)",
+                          color: "var(--color-destructive-foreground)",
+                        }
+                      : voiceStatus === "thinking"
+                        ? {
+                            background: "var(--color-warning)",
+                            color: "var(--color-warning-foreground)",
+                          }
+                        : voiceStatus === "speaking"
+                          ? {
+                              background: "var(--color-primary)",
+                              color: "var(--color-primary-foreground)",
+                            }
+                          : {
+                              background: "var(--color-muted)",
+                              color: "var(--color-muted-foreground)",
+                            }),
+                  }}
+                >
+                  {voiceStatus === "idle" && "正在初始化..."}
+                  {voiceStatus === "listening" && "正在聆听..."}
+                  {voiceStatus === "thinking" && "思考中..."}
+                  {voiceStatus === "speaking" && "AI 回复中..."}
+                  {voiceStatus === "error" && "出错，请重试"}
+                </div>
+              ) : (
+                /* 文本模式：输入框 + 发送按钮 */
+                <>
+                  <AntInput
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onPressEnter={sendChatMessage}
+                    placeholder="Type a message..."
+                    size="small"
+                    style={{ flex: 1, fontSize: 12 }}
+                  />
+                  <AntButton
+                    type="primary"
+                    size="small"
+                    icon={<Send style={{ width: 14, height: 14 }} />}
+                    onClick={sendChatMessage}
+                    disabled={chatLoading}
+                    style={{
+                      background: "var(--color-primary)",
+                      borderColor: "var(--color-primary)",
+                      color: "var(--color-primary-foreground)",
+                    }}
+                  />
+                </>
+              )}
             </Flex>
           </Layout.Footer>
         </Layout>

@@ -27,6 +27,10 @@ fal-client
 # Text-to-speech (Edge TTS is free, no API key needed)
 edge-tts
 
+# Voice conversation (VAD-driven real-time voice)
+numpy
+silero-vad
+
 # Optional: For cron expression parsing (cronjob scheduling)
 croniter
 
