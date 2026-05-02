@@ -374,6 +374,9 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        # 自定义系统提示词，用于配置 LLM 的性格和回答风格。
+        # 留空则使用默认身份（SOUL.md 或内置 Hermes Agent 身份）。
+        "system_prompt": "",
     },
     
     "terminal": {

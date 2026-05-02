@@ -97,6 +97,7 @@ export const zh: Translations = {
     noMessages: "暂无消息",
     untitledSession: "无标题会话",
     deleteSession: "删除会话",
+    deleteFailed: "删除会话失败，请重试",
     previousPage: "上一页",
     nextPage: "下一页",
     roles: {

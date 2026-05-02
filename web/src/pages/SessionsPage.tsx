@@ -26,6 +26,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useI18n } from "@/i18n";
+import { useToast } from "@/hooks/useToast";
+import { Toast } from "@/components/Toast";
 import {
   Layout,
   Flex,
@@ -325,6 +327,7 @@ export default function SessionsPage() {
   const [searching, setSearching] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(null);
   const { t } = useI18n();
+  const { toast, showToast } = useToast();
 
   // 对话状态
   const [chatMessages, setChatMessages] = useState<Array<{role: "user"|"assistant"; content: string}>>([]);
@@ -583,7 +586,7 @@ export default function SessionsPage() {
       setTotal((prev) => prev - 1);
       if (expandedId === id) setExpandedId(null);
     } catch {
-      // ignore
+      showToast(t.sessions.deleteFailed || "删除会话失败，请重试", "error");
     }
   };
 
@@ -686,6 +689,7 @@ export default function SessionsPage() {
 
   return (
     <div className="flex gap-4 h-[calc(100vh-120px)] overflow-hidden">
+      <Toast toast={toast} />
       {/* 左侧会话列表 */}
       <div className="flex-1 flex flex-col gap-4 overflow-hidden min-w-0">
         {/* Header outside card for lighter feel */}

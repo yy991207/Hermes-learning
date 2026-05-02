@@ -158,7 +158,48 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "tts.provider": {
         "type": "select",
         "description": "Text-to-speech provider",
-        "options": ["edge", "elevenlabs", "openai", "neutts"],
+        "options": ["edge", "aliyun", "elevenlabs", "openai", "neutts"],
+    },
+    "tts.edge.voice": {
+        "type": "select",
+        "description": "Edge TTS 发音人",
+        "options": [
+            "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural", "zh-CN-YunjianNeural",
+            "zh-CN-XiaoyiNeural", "zh-CN-YunyangNeural", "zh-CN-XiaochenNeural",
+            "zh-CN-XiaohanNeural", "zh-CN-XiaomengNeural", "zh-CN-XiaomoNeural",
+            "zh-CN-XiaoqiuNeural", "zh-CN-XiaoruiNeural", "zh-CN-XiaoshuangNeural",
+            "zh-CN-XiaoxuanNeural", "zh-CN-XiaoyanNeural", "zh-CN-XiaoyouNeural",
+            "zh-CN-XiaozhenNeural", "en-US-AriaNeural", "en-US-JennyNeural",
+        ],
+    },
+    "tts.openai.voice": {
+        "type": "select",
+        "description": "OpenAI TTS 发音人",
+        "options": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+    },
+    "tts.openai.model": {
+        "type": "select",
+        "description": "OpenAI TTS 模型",
+        "options": ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"],
+    },
+    "voice.aliyun.stt_model": {
+        "type": "select",
+        "description": "阿里云 STT 模型",
+        "options": ["sensevoice-v1"],
+    },
+    "voice.aliyun.tts_model": {
+        "type": "select",
+        "description": "阿里云 TTS 模型",
+        "options": ["cosyvoice-v1", "cosyvoice-v2"],
+    },
+    "voice.aliyun.tts_voice": {
+        "type": "select",
+        "description": "阿里云 TTS 发音人",
+        "options": [
+            "longxiaochun", "longxiaoxia", "longxiaobai", "longxiaochen",
+            "longxiaozhi", "longxiaomei", "longxiaofei", "longxiaotong",
+            "longxiaomeng", "longxiaojie", "longxiaorui", "longxiaoyu",
+        ],
     },
     "stt.provider": {
         "type": "select",
@@ -214,6 +255,11 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "select",
         "description": "API service tier (OpenAI/Anthropic)",
         "options": ["", "auto", "default", "flex"],
+    },
+    "agent.system_prompt": {
+        "type": "text",
+        "description": "自定义系统提示词，配置 LLM 的性格和回答风格。留空则使用默认身份（SOUL.md）",
+        "category": "agent",
     },
     "delegation.reasoning_effort": {
         "type": "select",
@@ -304,12 +350,19 @@ CONFIG_SCHEMA = _build_schema_from_config(DEFAULT_CONFIG)
 # Inject virtual fields that don't live in DEFAULT_CONFIG but are surfaced
 # by the normalize/denormalize cycle.  Insert model_context_length right after
 # the "model" key so it renders adjacent in the frontend.
+# Also inject voice.aliyun.* fields so the Aliyun TTS/STT config is visible
+# in ConfigPage when tts.provider is set to "aliyun".
 _mcl_entry = _SCHEMA_OVERRIDES["model_context_length"]
 _ordered_schema: Dict[str, Dict[str, Any]] = {}
 for _k, _v in CONFIG_SCHEMA.items():
     _ordered_schema[_k] = _v
     if _k == "model":
         _ordered_schema["model_context_length"] = _mcl_entry
+    if _k == "voice.silence_duration":
+        for _vk, _cat in (("voice.aliyun.stt_model", "stt"), ("voice.aliyun.tts_model", "tts"), ("voice.aliyun.tts_voice", "tts")):
+            _v = dict(_SCHEMA_OVERRIDES[_vk])
+            _v.setdefault("category", _cat)
+            _ordered_schema[_vk] = _v
 CONFIG_SCHEMA = _ordered_schema
 
 
@@ -2342,15 +2395,26 @@ def _chat_get_session_lock(session_id: str) -> asyncio.Lock:
 def _chat_get_agent(session_id: Optional[str] = None) -> Tuple[AIAgent, str]:
     global _chat_agent, _chat_session_id
     _chat_get_db()  # 确保 db 初始化
+    config = load_config()
+    system_prompt = (config.get("agent") or {}).get("system_prompt") or ""
+    # model 可能是裸字符串或 dict，统一处理两种格式
+    model_cfg = config.get("model") or {}
+    if isinstance(model_cfg, dict):
+        model_name = model_cfg.get("default", "deepseek-v4-pro")
+    else:
+        model_name = str(model_cfg) if model_cfg else "deepseek-v4-pro"
     if _chat_agent is None or session_id != _chat_session_id:
-        config = load_config()
         _chat_agent = AIAgent(
-            model=config.get("model", {}).get("default", "deepseek-v4-pro"),
+            model=model_name,
             session_id=session_id,
             save_trajectories=True,
             session_db=_chat_get_db(),
+            ephemeral_system_prompt=system_prompt or None,
         )
         _chat_session_id = _chat_agent.session_id
+    else:
+        # 每次请求都更新 system_prompt，避免缓存旧值导致配置修改不生效
+        _chat_agent.ephemeral_system_prompt = system_prompt or None
     return _chat_agent, _chat_session_id
 
 
@@ -2663,7 +2727,139 @@ async def voice_websocket_endpoint(ws: _WebSocket):
 
         _log.info("[voice] TTS start chars=%d preview=%r", len(tts_text), tts_text[:40])
 
+        # 读取 TTS 配置
+        from hermes_cli.config import load_config as _load_config
+        _cfg = _load_config()
+        tts_config = _cfg.get("tts", {})
+        provider = (tts_config.get("provider") or "edge").lower().strip()
+        _log.info("[voice] TTS provider=%s", provider)
+
         try:
+            if provider == "aliyun":
+                return _tts_aliyun(tts_text, _cfg)
+            elif provider == "openai":
+                return _tts_openai(tts_text, tts_config)
+            elif provider == "elevenlabs":
+                return _tts_elevenlabs(tts_text, tts_config)
+            elif provider == "neutts":
+                return _tts_neutts(tts_text, tts_config)
+            else:
+                return _tts_edge(tts_text, tts_config)
+        except Exception as e:
+            _log.warning("[voice] TTS provider=%s failed: %s, 回退到 edge-tts", provider, e)
+            try:
+                return _tts_edge(tts_text, tts_config)
+            except Exception as e2:
+                _log.error("[voice] TTS edge 回退也失败: %s", e2)
+                return {"success": False, "error": str(e2)}
+
+    def _tts_edge(tts_text: str, tts_config: dict) -> dict:
+        """Edge TTS —— 免费，无需 API Key，作为默认和回退 provider。"""
+        import edge_tts as _edge_tts
+
+        edge_config = tts_config.get("edge", {})
+        voice = edge_config.get("voice") or "zh-CN-XiaoxiaoNeural"
+
+        # 如果配置的 voice 语言与文本语言不匹配，自动切换
+        has_cjk = any("一" <= ch <= "鿿" for ch in tts_text)
+        voice_is_cjk = voice.startswith("zh-")
+        if has_cjk and not voice_is_cjk:
+            voice = "zh-CN-XiaoxiaoNeural"
+        elif not has_cjk and voice_is_cjk:
+            voice = "en-US-AriaNeural"
+
+        tmp = _tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            async def _gen():
+                communicate = _edge_tts.Communicate(tts_text, voice=voice)
+                await communicate.save(tmp_path)
+            _asyncio.run(_gen())
+            with open(tmp_path, "rb") as f:
+                audio_data = f.read()
+            _log.info("[voice] TTS edge success voice=%s bytes=%d", voice, len(audio_data))
+            return {"success": True, "audio_data": audio_data, "format": "mp3"}
+        finally:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def _tts_aliyun(tts_text: str, config: dict) -> dict:
+        """阿里云 DashScope CosyVoice TTS。读 voice.aliyun.* 配置。"""
+        from tools.aliyun_voice import aliyun_tts
+        result = aliyun_tts(tts_text)
+        if result.get("success"):
+            _log.info("[voice] TTS aliyun success bytes=%d", len(result.get("audio_data", b"")))
+        else:
+            _log.warning("[voice] TTS aliyun failed: %s", result.get("error"))
+        return result
+
+    def _tts_openai(tts_text: str, tts_config: dict) -> dict:
+        """OpenAI TTS。读 tts.openai.model / tts.openai.voice 配置，需要 OPENAI_API_KEY。"""
+        import openai as _openai
+
+        openai_config = tts_config.get("openai", {})
+        model = openai_config.get("model") or "gpt-4o-mini-tts"
+        voice = openai_config.get("voice") or "alloy"
+        api_key = _os.getenv("OPENAI_API_KEY", "")
+        base_url = _os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY 未设置")
+
+        client = _openai.OpenAI(api_key=api_key, base_url=base_url)
+        response = client.audio.speech.create(model=model, voice=voice, input=tts_text, response_format="mp3")
+        audio_data = response.content
+        _log.info("[voice] TTS openai success model=%s voice=%s bytes=%d", model, voice, len(audio_data))
+        return {"success": True, "audio_data": audio_data, "format": "mp3"}
+
+    def _tts_elevenlabs(tts_text: str, tts_config: dict) -> dict:
+        """ElevenLabs TTS。读 tts.elevenlabs.* 配置，需要 ELEVENLABS_API_KEY。"""
+        from elevenlabs.client import ElevenLabs as _ElevenLabs
+
+        el_config = tts_config.get("elevenlabs", {})
+        voice_id = el_config.get("voice_id") or "pNInz6obpgDQGcFmaJgB"
+        model_id = el_config.get("model_id") or "eleven_multilingual_v2"
+        api_key = _os.getenv("ELEVENLABS_API_KEY", "")
+        if not api_key:
+            raise ValueError("ELEVENLABS_API_KEY 未设置")
+
+        client = _ElevenLabs(api_key=api_key)
+        audio_gen = client.text_to_speech.convert(text=tts_text, voice_id=voice_id, model_id=model_id, output_format="mp3_44100_128")
+        chunks = []
+        for chunk in audio_gen:
+            if chunk:
+                chunks.append(chunk)
+        audio_data = b"".join(chunks)
+        _log.info("[voice] TTS elevenlabs success voice=%s model=%s bytes=%d", voice_id, model_id, len(audio_data))
+        return {"success": True, "audio_data": audio_data, "format": "mp3"}
+
+    def _tts_neutts(tts_text: str, tts_config: dict) -> dict:
+        """NeuTTS 本地合成。读 tts.neutts.* 配置，不需要网络。"""
+        neutts_config = tts_config.get("neutts", {})
+        model = neutts_config.get("model") or "neuphonic/neutts-air-q4-gguf"
+        device = neutts_config.get("device") or "cpu"
+        ref_audio = neutts_config.get("ref_audio") or ""
+        ref_text = neutts_config.get("ref_text") or ""
+
+        import neutts as _neutts
+
+        tmp = _tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            synth = _neutts.NeuTTS(model=model, device=device, ref_audio=ref_audio or None, ref_text=ref_text or None)
+            synth.synthesize(tts_text, tmp_path)
+            with open(tmp_path, "rb") as f:
+                audio_data = f.read()
+            _log.info("[voice] TTS neutts success bytes=%d", len(audio_data))
+            return {"success": True, "audio_data": audio_data, "format": "wav"}
+        finally:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
             import edge_tts
 
             # 中英文本做一个简单的默认 voice 选择
@@ -2687,16 +2883,6 @@ async def voice_websocket_endpoint(ws: _WebSocket):
                 pass
             _log.info("[voice] TTS edge success voice=%s bytes=%d", voice, len(audio_data))
             return {"success": True, "audio_data": audio_data, "format": "mp3"}
-        except Exception as e:
-            _log.warning("[voice] TTS edge failed: %s", e)
-            from tools.aliyun_voice import aliyun_tts
-            result = aliyun_tts(text)
-            if result.get("success"):
-                _log.info("[voice] TTS aliyun success bytes=%d", len(result.get("audio_data", b"")))
-            else:
-                _log.warning("[voice] TTS aliyun failed: %s", result.get("error"))
-            return result
-
     def _run_agent_sync(
         user_text: str,
         sid: str,
@@ -2710,11 +2896,18 @@ async def voice_websocket_endpoint(ws: _WebSocket):
 
         config = load_config()
         db = SessionDB()
+        system_prompt = (config.get("agent") or {}).get("system_prompt") or ""
+        model_cfg = config.get("model") or {}
+        if isinstance(model_cfg, dict):
+            model_name = model_cfg.get("default", "deepseek-v4-pro")
+        else:
+            model_name = str(model_cfg) if model_cfg else "deepseek-v4-pro"
         agent = AIAgent(
-            model=config.get("model", {}).get("default", "deepseek-v4-pro"),
+            model=model_name,
             session_id=sid,
             save_trajectories=False,
             session_db=db,
+            ephemeral_system_prompt=system_prompt or None,
         )
 
         def _on_delta(text: str):

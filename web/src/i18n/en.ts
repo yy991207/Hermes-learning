@@ -97,6 +97,7 @@ export const en: Translations = {
     noMessages: "No messages",
     untitledSession: "Untitled session",
     deleteSession: "Delete session",
+    deleteFailed: "Failed to delete session, please try again",
     previousPage: "Previous page",
     nextPage: "Next page",
     roles: {

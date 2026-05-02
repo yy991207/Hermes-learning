@@ -273,8 +273,16 @@ export default function ConfigPage() {
               schemaKey={key}
               schema={s}
               value={getNestedValue(config, key)}
-              onChange={(v) => setConfig(setNestedValue(config, key, v))}
+              onChange={(v) => setConfig((prev) => setNestedValue(prev ?? {}, key, v))}
             />
+            {key === "agent.system_prompt" && (
+              <div className="mt-2 flex justify-end">
+                <Button size="sm" onClick={handleSave} disabled={saving} className="gap-1.5">
+                  <Save className="h-3.5 w-3.5" />
+                  {saving ? t.common.saving : t.common.save}
+                </Button>
+              </div>
+            )}
           </div>
         </div>
       );

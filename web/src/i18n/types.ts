@@ -101,6 +101,7 @@ export interface Translations {
     noMessages: string;
     untitledSession: string;
     deleteSession: string;
+    deleteFailed: string;
     previousPage: string;
     nextPage: string;
     roles: {
