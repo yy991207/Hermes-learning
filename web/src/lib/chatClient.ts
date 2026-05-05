@@ -13,9 +13,39 @@
  *   client.abort(messageId);
  */
 
+export type ChatToolEvent = {
+  seq: number;
+  kind: "tool_started" | "tool_completed";
+  toolName: string;
+  preview?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  duration?: number;
+  isError?: boolean;
+};
+
 export type ChatEvent =
   | { type: "meta"; messageId: string; sessionId: string; resume?: boolean }
   | { type: "token"; messageId: string; seq: number; delta: string }
+  | {
+      type: "tool_started";
+      messageId: string;
+      seq: number;
+      toolName: string;
+      preview?: string;
+      args?: Record<string, unknown>;
+    }
+  | {
+      type: "tool_completed";
+      messageId: string;
+      seq: number;
+      toolName: string;
+      preview?: string;
+      args?: Record<string, unknown>;
+      result?: string;
+      duration?: number;
+      isError?: boolean;
+    }
   | { type: "done"; messageId: string; final: string }
   | { type: "error"; messageId: string; error: string }
   | {
@@ -28,6 +58,7 @@ export type ChatEvent =
         text: string;
         finalText?: string;
         error?: string;
+        timeline?: ChatToolEvent[];
       }[];
     };
 
@@ -139,6 +170,33 @@ function buildMainThreadClient(): ChatClient {
         } else if (event === "token") {
           const seq = id != null ? Number(id) : 0;
           for (const l of listeners) l({ type: "token", messageId, seq, delta: payload.delta ?? "" });
+        } else if (event === "tool_started") {
+          const seq = id != null ? Number(id) : 0;
+          for (const l of listeners) {
+            l({
+              type: "tool_started",
+              messageId,
+              seq,
+              toolName: String(payload.tool_name ?? ""),
+              preview: typeof payload.preview === "string" ? payload.preview : undefined,
+              args: (payload.args as Record<string, unknown> | undefined) ?? undefined,
+            });
+          }
+        } else if (event === "tool_completed") {
+          const seq = id != null ? Number(id) : 0;
+          for (const l of listeners) {
+            l({
+              type: "tool_completed",
+              messageId,
+              seq,
+              toolName: String(payload.tool_name ?? ""),
+              preview: typeof payload.preview === "string" ? payload.preview : undefined,
+              args: (payload.args as Record<string, unknown> | undefined) ?? undefined,
+              result: typeof payload.result === "string" ? payload.result : undefined,
+              duration: typeof payload.duration === "number" ? payload.duration : undefined,
+              isError: payload.is_error === true,
+            });
+          }
         } else if (event === "done") {
           for (const l of listeners) l({ type: "done", messageId, final: payload.final ?? "" });
         } else if (event === "error") {

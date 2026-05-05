@@ -19,12 +19,24 @@
  *   { type: 'snapshot', streams: { messageId, sessionId, status, lastSeq, text }[] }
  */
 
+interface StreamToolEvent {
+  seq: number;
+  kind: "tool_started" | "tool_completed";
+  toolName: string;
+  preview?: string;
+  args?: Record<string, unknown>;
+  result?: string;
+  duration?: number;
+  isError?: boolean;
+}
+
 interface StreamState {
   messageId: string;
   sessionId: string;
   status: "running" | "done" | "error" | "aborted";
   buffer: { seq: number; delta: string }[];
   text: string;          // 累积文本，方便新 Tab 一次性回放
+  timeline: StreamToolEvent[];
   finalText?: string;
   error?: string;
   abort?: AbortController;
@@ -157,6 +169,48 @@ function handleFrame(state: StreamState, ev: { event: string; data: string; id?:
         status: "running",
       });
     }
+  } else if (ev.event === "tool_started") {
+    const seq = ev.id != null ? Number(ev.id) : state.buffer.length;
+    const item: StreamToolEvent = {
+      seq,
+      kind: "tool_started",
+      toolName: String(payload.tool_name ?? ""),
+      preview: typeof payload.preview === "string" ? payload.preview : undefined,
+      args: (payload.args as Record<string, unknown> | undefined) ?? undefined,
+    };
+    state.timeline.push(item);
+    broadcast({
+      type: "tool_started",
+      messageId: state.messageId,
+      seq,
+      toolName: item.toolName,
+      preview: item.preview,
+      args: item.args,
+    });
+  } else if (ev.event === "tool_completed") {
+    const seq = ev.id != null ? Number(ev.id) : state.buffer.length;
+    const item: StreamToolEvent = {
+      seq,
+      kind: "tool_completed",
+      toolName: String(payload.tool_name ?? ""),
+      preview: typeof payload.preview === "string" ? payload.preview : undefined,
+      args: (payload.args as Record<string, unknown> | undefined) ?? undefined,
+      result: typeof payload.result === "string" ? payload.result : undefined,
+      duration: typeof payload.duration === "number" ? payload.duration : undefined,
+      isError: payload.is_error === true,
+    };
+    state.timeline.push(item);
+    broadcast({
+      type: "tool_completed",
+      messageId: state.messageId,
+      seq,
+      toolName: item.toolName,
+      preview: item.preview,
+      args: item.args,
+      result: item.result,
+      duration: item.duration,
+      isError: item.isError,
+    });
   } else if (ev.event === "done") {
     state.status = "done";
     state.finalText = (payload.final as string) ?? state.text;
@@ -182,6 +236,7 @@ async function startSend(args: {
     status: "running",
     buffer: [],
     text: "",
+    timeline: [],
     abort: new AbortController(),
   };
   streams.set(args.messageId, state);
@@ -227,6 +282,7 @@ async function startResume(args: { messageId: string; lastSeq: number; token?: s
       status: "running",
       buffer: [],
       text: "",
+      timeline: [],
       abort: new AbortController(),
     };
     streams.set(args.messageId, state);
@@ -255,6 +311,7 @@ function snapshotForPort(port: MessagePort) {
     text: s.text,
     finalText: s.finalText,
     error: s.error,
+    timeline: s.timeline,
   }));
   port.postMessage({ type: "snapshot", streams: arr });
 }

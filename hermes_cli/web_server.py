@@ -2462,14 +2462,27 @@ async def _chat_run_stream(
         s = next(seq_counter)
         loop.call_soon_threadsafe(queue.put_nowait, ("token", s, text))
 
-    prev_cb = getattr(agent, "stream_delta_callback", None)
-    agent.stream_delta_callback = _on_delta
+    def _on_tool_progress(event_type, tool_name, preview, args, **extra):
+        s = next(seq_counter)
+        payload = {
+            "tool_name": tool_name,
+            "preview": preview,
+            "args": args,
+        }
+        payload.update(extra)
+        loop.call_soon_threadsafe(queue.put_nowait, (event_type, s, payload))
 
-    async def _persist_chunk(s: int, text: str):
+    prev_cb = getattr(agent, "stream_delta_callback", None)
+    prev_tool_progress_cb = getattr(agent, "tool_progress_callback", None)
+    agent.stream_delta_callback = _on_delta
+    agent.tool_progress_callback = _on_tool_progress
+
+    async def _persist_chunk(s: int, payload: object, kind: str = "token"):
         try:
-            await asyncio.to_thread(db.append_message_chunk, message_id, s, text, "token")
+            delta = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+            await asyncio.to_thread(db.append_message_chunk, message_id, s, delta, kind)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("persist chat chunk failed seq=%d: %s", s, exc)
+            _log.warning("persist chat chunk failed seq=%d kind=%s: %s", s, kind, exc)
 
     sess_lock = _chat_get_session_lock(sid)
     await sess_lock.acquire()  # 同 session 串行
@@ -2484,18 +2497,32 @@ async def _chat_run_stream(
                     {getter, agent_task}, return_when=asyncio.FIRST_COMPLETED
                 )
                 if getter in done:
-                    _kind, s, text = getter.result()
-                    yield _sse_pack("token", {"delta": text}, seq=s)
-                    asyncio.create_task(_persist_chunk(s, text))
+                    _kind, s, payload = getter.result()
+                    if _kind == "token":
+                        yield _sse_pack("token", {"delta": payload}, seq=s)
+                        asyncio.create_task(_persist_chunk(s, payload, "token"))
+                    elif _kind == "tool.started":
+                        yield _sse_pack("tool_started", payload, seq=s)
+                        asyncio.create_task(_persist_chunk(s, payload, "tool.started"))
+                    elif _kind == "tool.completed":
+                        yield _sse_pack("tool_completed", payload, seq=s)
+                        asyncio.create_task(_persist_chunk(s, payload, "tool.completed"))
                 else:
                     getter.cancel()
 
                 if agent_task.done():
                     # 抽干残留 token
                     while not queue.empty():
-                        _kind, s, text = queue.get_nowait()
-                        yield _sse_pack("token", {"delta": text}, seq=s)
-                        asyncio.create_task(_persist_chunk(s, text))
+                        _kind, s, payload = queue.get_nowait()
+                        if _kind == "token":
+                            yield _sse_pack("token", {"delta": payload}, seq=s)
+                            asyncio.create_task(_persist_chunk(s, payload, "token"))
+                        elif _kind == "tool.started":
+                            yield _sse_pack("tool_started", payload, seq=s)
+                            asyncio.create_task(_persist_chunk(s, payload, "tool.started"))
+                        elif _kind == "tool.completed":
+                            yield _sse_pack("tool_completed", payload, seq=s)
+                            asyncio.create_task(_persist_chunk(s, payload, "tool.completed"))
 
                     if agent_task.exception() is not None:
                         err = repr(agent_task.exception())
@@ -2518,6 +2545,7 @@ async def _chat_run_stream(
             raise
     finally:
         agent.stream_delta_callback = prev_cb
+        agent.tool_progress_callback = prev_tool_progress_cb
         sess_lock.release()
 
 
@@ -2553,8 +2581,13 @@ async def _chat_run_resume(
 
     cursor = last_seq
     chunks = await asyncio.to_thread(db.get_chunks_after, message_id, cursor)
-    for seq, delta, _kind in chunks:
-        yield _sse_pack("token", {"delta": delta}, seq=seq)
+    for seq, delta, kind in chunks:
+        if kind == "token":
+            yield _sse_pack("token", {"delta": delta}, seq=seq)
+        elif kind == "tool.started":
+            yield _sse_pack("tool_started", json.loads(delta), seq=seq)
+        elif kind == "tool.completed":
+            yield _sse_pack("tool_completed", json.loads(delta), seq=seq)
         cursor = seq
 
     while True:
@@ -2563,8 +2596,13 @@ async def _chat_run_resume(
             yield _sse_pack("error", {"error": "stream vanished"})
             return
         chunks = await asyncio.to_thread(db.get_chunks_after, message_id, cursor)
-        for seq, delta, _kind in chunks:
-            yield _sse_pack("token", {"delta": delta}, seq=seq)
+        for seq, delta, kind in chunks:
+            if kind == "token":
+                yield _sse_pack("token", {"delta": delta}, seq=seq)
+            elif kind == "tool.started":
+                yield _sse_pack("tool_started", json.loads(delta), seq=seq)
+            elif kind == "tool.completed":
+                yield _sse_pack("tool_completed", json.loads(delta), seq=seq)
             cursor = seq
 
         status = info["status"]

@@ -32,7 +32,6 @@ import {
   Layout,
   Flex,
   Typography,
-  Card,
   Spin,
   Input as AntInput,
   Button as AntButton,
@@ -110,57 +109,92 @@ function ToolCallBlock({ toolCall }: { toolCall: { id: string; function: { name:
   );
 }
 
+function formatToolContent(msg: SessionMessage): string | null {
+  if (!msg.content) return msg.content;
+  if (msg.role !== "tool") return msg.content;
+  if (msg.tool_name !== "terminal") return msg.content;
+
+  try {
+    const parsed = JSON.parse(msg.content) as {
+      output?: unknown;
+      exit_code?: unknown;
+      error?: unknown;
+    };
+
+    const output = typeof parsed.output === "string" ? parsed.output.trim() : "";
+    const error = typeof parsed.error === "string" ? parsed.error.trim() : "";
+    const exitCode = typeof parsed.exit_code === "number" ? parsed.exit_code : null;
+
+    if (output) {
+      if (error) {
+        return `${output}\n\n---\n\n错误：${error}`;
+      }
+      if (exitCode !== null && exitCode !== 0) {
+        return `${output}\n\n---\n\n退出码：${exitCode}`;
+      }
+      return output;
+    }
+
+    if (error) return `错误：${error}`;
+    if (exitCode !== null && exitCode !== 0) return `退出码：${exitCode}`;
+    return msg.content;
+  } catch {
+    return msg.content;
+  }
+}
+
 function MessageBubble({ msg, highlight }: { msg: SessionMessage; highlight?: string }) {
-  const { t } = useI18n();
+    const { t } = useI18n();
 
-  const ROLE_STYLES: Record<string, { bg: string; text: string; label: string }> = {
-    user: { bg: "bg-primary/10", text: "text-primary", label: t.sessions.roles.user },
-    assistant: { bg: "bg-success/10", text: "text-success", label: t.sessions.roles.assistant },
-    system: { bg: "bg-muted", text: "text-muted-foreground", label: t.sessions.roles.system },
-    tool: { bg: "bg-warning/10", text: "text-warning", label: t.sessions.roles.tool },
-  };
+    const ROLE_STYLES: Record<string, { bg: string; text: string; label: string }> = {
+      user: { bg: "bg-primary/10", text: "text-primary", label: t.sessions.roles.user },
+      assistant: { bg: "bg-success/10", text: "text-success", label: t.sessions.roles.assistant },
+      system: { bg: "bg-muted", text: "text-muted-foreground", label: t.sessions.roles.system },
+      tool: { bg: "bg-warning/10", text: "text-warning", label: t.sessions.roles.tool },
+    };
 
-  const style = ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
-  const label = msg.tool_name ? `${t.sessions.roles.tool}: ${msg.tool_name}` : style.label;
+    const style = ROLE_STYLES[msg.role] ?? ROLE_STYLES.system;
+    const label = msg.tool_name ? `${t.sessions.roles.tool}: ${msg.tool_name}` : style.label;
+    const displayContent = formatToolContent(msg);
 
-  // Check if any search term appears as a prefix of any word in content
-  const isHit = (() => {
-    if (!highlight || !msg.content) return false;
-    const content = msg.content.toLowerCase();
-    const terms = highlight.toLowerCase().split(/\s+/).filter(Boolean);
-    return terms.some((term) => content.includes(term));
-  })();
+    // Check if any search term appears as a prefix of any word in content
+    const isHit = (() => {
+      if (!highlight || !displayContent) return false;
+      const content = displayContent.toLowerCase();
+      const terms = highlight.toLowerCase().split(/\s+/).filter(Boolean);
+      return terms.some((term) => content.includes(term));
+    })();
 
-  // Split search query into terms for inline highlighting
-  const highlightTerms = isHit && highlight
-    ? highlight.split(/\s+/).filter(Boolean)
-    : undefined;
+    // Split search query into terms for inline highlighting
+    const highlightTerms = isHit && highlight
+      ? highlight.split(/\s+/).filter(Boolean)
+      : undefined;
 
-  return (
-    <div className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""}`} data-search-hit={isHit || undefined}>
-      <div className="flex items-center gap-2 mb-1">
-        <span className={`text-xs font-semibold ${style.text}`}>{label}</span>
-        {isHit && (
-          <Badge variant="warning" className="text-[9px] py-0 px-1.5">{t.common.match}</Badge>
+    return (
+      <div className={`${style.bg} p-3 ${isHit ? "ring-1 ring-warning/40" : ""}`} data-search-hit={isHit || undefined}>
+        <div className="flex items-center gap-2 mb-1">
+          <span className={`text-xs font-semibold ${style.text}`}>{label}</span>
+          {isHit && (
+            <Badge variant="warning" className="text-[9px] py-0 px-1.5">{t.common.match}</Badge>
+          )}
+          {msg.timestamp && (
+            <span className="text-[10px] text-muted-foreground">{timeAgo(msg.timestamp)}</span>
+          )}
+        </div>
+        {displayContent && (
+          msg.role === "system"
+            ? <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">{displayContent}</div>
+            : <Markdown content={displayContent} highlightTerms={highlightTerms} />
         )}
-        {msg.timestamp && (
-          <span className="text-[10px] text-muted-foreground">{timeAgo(msg.timestamp)}</span>
+        {msg.tool_calls && msg.tool_calls.length > 0 && (
+          <div className="mt-1">
+            {msg.tool_calls.map((tc) => (
+              <ToolCallBlock key={tc.id} toolCall={tc} />
+            ))}
+          </div>
         )}
       </div>
-      {msg.content && (
-        msg.role === "system"
-          ? <div className="text-sm text-foreground whitespace-pre-wrap leading-relaxed">{msg.content}</div>
-          : <Markdown content={msg.content} highlightTerms={highlightTerms} />
-      )}
-      {msg.tool_calls && msg.tool_calls.length > 0 && (
-        <div className="mt-1">
-          {msg.tool_calls.map((tc) => (
-            <ToolCallBlock key={tc.id} toolCall={tc} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
+    );
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -279,40 +313,38 @@ function SessionRow({
   );
 }
 
-/** 聊天消息气泡（antd Card 风格） */
-function ChatBubble({ role, content }: { role: "user" | "assistant"; content: string }) {
-  const isUser = role === "user";
-  return (
-    <Flex justify={isUser ? "flex-end" : "flex-start"}>
-      <Card
-        size="small"
-        styles={{
-          body: {
-            padding: "8px 12px",
-            background: isUser ? "var(--color-primary)" : "var(--color-muted)",
-            border: "none",
-          },
-        }}
-        style={{
-          maxWidth: "80%",
-          border: "none",
-          borderRadius: 4,
-        }}
-      >
-        <Text
-          style={{
-            color: isUser ? "var(--color-primary-foreground)" : "var(--color-foreground)",
-            fontSize: 13,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-            lineHeight: 1.6,
-          }}
-        >
-          {content}
-        </Text>
-      </Card>
-    </Flex>
-  );
+type ChatRenderMessage = SessionMessage & {
+  _streamKey?: string;
+};
+
+function buildToolCallMessage(
+  seq: number,
+  toolName: string,
+  args?: Record<string, unknown>,
+): ChatRenderMessage {
+  return {
+    role: "assistant",
+    content: null,
+    tool_calls: [{
+      id: `stream-tool-${seq}`,
+      function: {
+        name: toolName,
+        arguments: JSON.stringify(args ?? {}, null, 2),
+      },
+    }],
+    timestamp: Date.now() / 1000,
+    _streamKey: `tool-started-${seq}`,
+  };
+}
+
+function buildToolResultMessage(evt: Extract<ChatEvent, { type: "tool_completed" }>): ChatRenderMessage {
+  return {
+    role: "tool",
+    content: evt.result ?? evt.preview ?? "",
+    tool_name: evt.toolName,
+    timestamp: Date.now() / 1000,
+    _streamKey: `tool-completed-${evt.seq}`,
+  };
 }
 
 export default function SessionsPage() {
@@ -330,7 +362,7 @@ export default function SessionsPage() {
   const { toast, showToast } = useToast();
 
   // 对话状态
-  const [chatMessages, setChatMessages] = useState<Array<{role: "user"|"assistant"; content: string}>>([]);
+  const [chatMessages, setChatMessages] = useState<ChatRenderMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatSessionId, setChatSessionId] = useState<string | undefined>();
@@ -391,18 +423,33 @@ export default function SessionsPage() {
             setActiveSessionId(running.sessionId);
           }
           setChatMessages((prev) => {
-            // 找最后一条 assistant；没有就追加一条
+            // 找最后一条真正的 assistant 文本消息；没有就追加一条
             let idx = -1;
             for (let i = prev.length - 1; i >= 0; i--) {
-              if (prev[i].role === "assistant") { idx = i; break; }
+              if (prev[i].role === "assistant" && prev[i].content !== null) { idx = i; break; }
             }
             const copy = [...prev];
             if (idx === -1) {
               copy.push({ role: "assistant", content: running.text });
               streamingIdxRef.current = copy.length - 1;
             } else {
-              copy[idx] = { role: "assistant", content: running.text };
+              copy[idx] = { ...copy[idx], role: "assistant", content: running.text };
               streamingIdxRef.current = idx;
+            }
+            for (const item of running.timeline ?? []) {
+              const key = item.kind === "tool_started" ? `tool-started-${item.seq}` : `tool-completed-${item.seq}`;
+              if (copy.some((m) => m._streamKey === key)) continue;
+              if (item.kind === "tool_started") {
+                copy.push(buildToolCallMessage(item.seq, item.toolName, item.args));
+              } else {
+                copy.push({
+                  role: "tool",
+                  content: item.result ?? item.preview ?? "",
+                  tool_name: item.toolName,
+                  timestamp: Date.now() / 1000,
+                  _streamKey: key,
+                });
+              }
             }
             return copy;
           });
@@ -423,9 +470,23 @@ export default function SessionsPage() {
           const idx = streamingIdxRef.current;
           if (idx == null || idx >= prev.length) return prev;
           const copy = [...prev];
-          copy[idx] = { role: "assistant", content: copy[idx].content + evt.delta };
+          copy[idx] = {
+            ...copy[idx],
+            role: "assistant",
+            content: (copy[idx].content ?? "") + evt.delta,
+          };
           return copy;
         });
+        return;
+      }
+
+      if (evt.type === "tool_started") {
+        setChatMessages((prev) => [...prev, buildToolCallMessage(evt.seq, evt.toolName, evt.args)]);
+        return;
+      }
+
+      if (evt.type === "tool_completed") {
+        setChatMessages((prev) => [...prev, buildToolResultMessage(evt)]);
         return;
       }
 
@@ -435,8 +496,9 @@ export default function SessionsPage() {
           const idx = streamingIdxRef.current;
           if (idx == null || idx >= prev.length) return prev;
           const copy = [...prev];
-          if (evt.final && evt.final.length >= copy[idx].content.length) {
-            copy[idx] = { role: "assistant", content: evt.final };
+          const currentContent = copy[idx].content ?? "";
+          if (evt.final && evt.final.length >= currentContent.length) {
+            copy[idx] = { ...copy[idx], role: "assistant", content: evt.final };
           }
           return copy;
         });
@@ -453,7 +515,11 @@ export default function SessionsPage() {
           const errText = "Error: " + evt.error;
           if (idx == null || idx >= prev.length) return [...prev, { role: "assistant", content: errText }];
           const copy = [...prev];
-          copy[idx] = { role: "assistant", content: copy[idx].content + "\n\n" + errText };
+          copy[idx] = {
+            ...copy[idx],
+            role: "assistant",
+            content: (copy[idx].content ?? "") + "\n\n" + errText,
+          };
           return copy;
         });
         setChatLoading(false);
@@ -495,19 +561,27 @@ export default function SessionsPage() {
         setVoiceStatus(evt.status);
       } else if (evt.type === "transcription") {
         voiceTranscriptRef.current = evt.text;
-        setChatMessages((prev) => [
-          ...prev,
-          { role: "user", content: evt.text },
-          { role: "assistant", content: "" },
-        ]);
-        streamingIdxRef.current = null;
+        setChatMessages((prev) => {
+          const next = [
+            ...prev,
+            { role: "user", content: evt.text },
+            { role: "assistant", content: "" },
+          ] as ChatRenderMessage[];
+          streamingIdxRef.current = next.length - 1;
+          return next;
+        });
         setChatLoading(true);
       } else if (evt.type === "token") {
         setChatMessages((prev) => {
           const copy = [...prev];
+          const idx = streamingIdxRef.current;
+          if (idx != null && idx >= 0 && idx < copy.length && copy[idx].role === "assistant") {
+            copy[idx] = { ...copy[idx], content: (copy[idx].content ?? "") + evt.delta };
+            return copy;
+          }
           for (let i = copy.length - 1; i >= 0; i--) {
             if (copy[i].role === "assistant") {
-              copy[i] = { ...copy[i], content: copy[i].content + evt.delta };
+              copy[i] = { ...copy[i], content: (copy[i].content ?? "") + evt.delta };
               break;
             }
           }
@@ -637,12 +711,11 @@ export default function SessionsPage() {
     setChatLoading(true);
     try {
       const resp = await api.getSessionMessages(sessionId);
-      const msgs = resp.messages
-        .filter((m) => (m.role === "user" || m.role === "assistant") && m.content && m.content.trim())
-        .map((m) => ({
-          role: m.role as "user" | "assistant",
-          content: m.content as string,
-        }));
+      const msgs = resp.messages.filter((m) => {
+        if (m.role === "tool") return true;
+        if (m.tool_calls && m.tool_calls.length > 0) return true;
+        return !!(m.content && m.content.trim());
+      }) as ChatRenderMessage[];
       setChatMessages(msgs);
     } catch (err) {
       setChatMessages([{ role: "assistant", content: "加载会话失败: " + err }]);
@@ -840,13 +913,13 @@ export default function SessionsPage() {
                 const isStreamingTail =
                   streamingMsgId !== null &&
                   msg.role === "assistant" &&
-                  i === streamingIdxRef.current;
-                const display = isStreamingTail ? msg.content + "▍" : msg.content;
+                  i === streamingIdxRef.current &&
+                  msg.content !== null;
+                const display = isStreamingTail ? (msg.content ?? "") + "▍" : msg.content;
                 return (
-                  <ChatBubble
-                    key={i}
-                    role={msg.role}
-                    content={display}
+                  <MessageBubble
+                    key={msg._streamKey ?? i}
+                    msg={{ ...msg, content: display ?? msg.content }}
                   />
                 );
               })}

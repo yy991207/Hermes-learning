@@ -223,6 +223,19 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "aliyun":
+            try:
+                from tools.aliyun_voice import _get_api_key as _aliyun_get_api_key
+                if _HAS_OPENAI and _aliyun_get_api_key():
+                    return "aliyun"
+            except Exception:
+                pass
+            logger.warning(
+                "STT provider 'aliyun' configured but DashScope key not set "
+                "or openai package unavailable"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
     # --- Auto-detect (no explicit provider): local > groq > openai > mistral -
@@ -516,6 +529,35 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": f"Transcription failed: {e}"}
 
 # ---------------------------------------------------------------------------
+# Provider: aliyun (DashScope SenseVoice)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_aliyun(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using Aliyun DashScope STT.
+
+    The actual API call lives in [`aliyun_stt()`](tools/aliyun_voice.py:176).
+    Here we only read the audio file bytes and forward them.
+    """
+    try:
+        from tools.aliyun_voice import aliyun_stt
+
+        with open(file_path, "rb") as audio_file:
+            audio_data = audio_file.read()
+
+        audio_format = Path(file_path).suffix.lower().lstrip(".") or "wav"
+        result = aliyun_stt(audio_data, audio_format)
+        if result.get("success"):
+            result["provider"] = "aliyun"
+        return result
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Aliyun transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Aliyun transcription failed: {e}"}
+
+# ---------------------------------------------------------------------------
 # Provider: mistral (Voxtral Transcribe API)
 # ---------------------------------------------------------------------------
 
@@ -619,6 +661,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         mistral_cfg = stt_config.get("mistral", {})
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
         return _transcribe_mistral(file_path, model_name)
+
+    if provider == "aliyun":
+        aliyun_cfg = _load_stt_config().get("aliyun", {})
+        model_name = model or aliyun_cfg.get("model", "sensevoice-v1")
+        return _transcribe_aliyun(file_path, model_name)
 
     # No provider available
     return {

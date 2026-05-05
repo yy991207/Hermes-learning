@@ -174,17 +174,18 @@ def _strip_markdown_for_tts(text: str) -> str:
 
 
 def aliyun_stt(audio_data: bytes, audio_format: str = "wav") -> Dict[str, Any]:
-    """使用 Aliyun DashScope STT 转写音频。
+    """使用 Aliyun DashScope 原生流式 STT 转写音频。
+
+    这里不再走 OpenAI-compatible `/audio/transcriptions`，
+    而是改用 DashScope SDK 的 `Recognition.start/send_audio_frame/stop`。
 
     Args:
-        audio_data: 原始音频字节（WAV、WebM、MP3 等格式）
-        audio_format: 音频格式扩展名（wav、webm、mp3），默认 wav
+        audio_data: 原始音频字节。当前优先支持 WAV / PCM。
+        audio_format: 音频格式扩展名（wav、pcm），默认 wav。
 
     Returns:
         {"success": True, "transcript": "转写文字"}
         或 {"success": False, "error": "错误描述"}
-
-    临时文件在处理完成后立即删除，不做持久存储。
     """
     api_key = _get_api_key()
     if not api_key:
@@ -198,43 +199,82 @@ def aliyun_stt(audio_data: bytes, audio_format: str = "wav") -> Dict[str, Any]:
 
     cfg = _get_aliyun_config()
     model = cfg.get("stt_model", DEFAULT_STT_MODEL)
-    base_url = cfg.get("base_url", DEFAULT_BASE_URL)
 
-    # DashScope STT 需要文件对象，写入临时文件后立即删除
-    tmp_path = None
+    # Recognition 流式接口更适合本地短音频直传。
+    # WebSocket 语音链路当前产物是 16kHz / mono / 16bit PCM 封装成 WAV。
+    if audio_format.lower() not in {"wav", "pcm"}:
+        return {"success": False, "error": f"Aliyun STT 暂不支持当前直传格式: {audio_format}"}
+
     try:
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=f".{audio_format}", delete=False
+        import dashscope
+        from dashscope.audio.asr.recognition import Recognition, RecognitionCallback
+
+        dashscope.api_key = api_key
+
+        # WAV 需要剥掉 44 字节头，Recognition 流式接口送原始 PCM 更稳。
+        pcm_payload = audio_data
+        if audio_format.lower() == "wav" and len(audio_data) > 44 and audio_data[:4] == b"RIFF":
+            pcm_payload = audio_data[44:]
+
+        class _Callback(RecognitionCallback):
+            def __init__(self):
+                self.sentences = []
+                self.error_message = ""
+
+            def on_event(self, result):
+                try:
+                    sentence = result.get_sentence()
+                    logger.info("Aliyun Recognition on_event sentence=%r", sentence)
+                    if isinstance(sentence, dict):
+                        from dashscope.audio.asr.recognition import RecognitionResult
+                        if RecognitionResult.is_sentence_end(sentence):
+                            text = sentence.get("text")
+                            if text:
+                                self.sentences.append(text)
+                    elif isinstance(sentence, list):
+                        from dashscope.audio.asr.recognition import RecognitionResult
+                        for item in sentence:
+                            logger.info("Aliyun Recognition on_event sentence_item=%r", item)
+                            if isinstance(item, dict) and RecognitionResult.is_sentence_end(item):
+                                text = item.get("text")
+                                if text:
+                                    self.sentences.append(text)
+                except Exception as exc:
+                    self.error_message = f"Aliyun Recognition 回调解析失败: {exc}"
+
+            def on_error(self, result):
+                try:
+                    self.error_message = str(result)
+                except Exception:
+                    self.error_message = "Aliyun Recognition on_error"
+
+        callback = _Callback()
+        recognition = Recognition(
+            model=model,
+            callback=callback,
+            format="pcm",
+            sample_rate=16000,
         )
-        tmp.write(audio_data)
-        tmp.close()
-        tmp_path = tmp.name
+        recognition.start()
 
-        import openai
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        # 分片发送，避免一次过大。
+        frame_size = 3200  # 约 100ms @ 16kHz, 16bit, mono
+        for i in range(0, len(pcm_payload), frame_size):
+            recognition.send_audio_frame(pcm_payload[i:i + frame_size])
+        recognition.stop()
 
-        with open(tmp_path, "rb") as f:
-            response = client.audio.transcriptions.create(
-                model=model,
-                file=f,
-                response_format="json",
-            )
+        transcript = "".join(callback.sentences).strip()
+        if callback.error_message and not transcript:
+            return {"success": False, "error": callback.error_message}
+        if not transcript:
+            return {"success": False, "error": "Aliyun STT 未返回可用转写文本"}
 
-        transcript = response.text if hasattr(response, 'text') else str(response)
-        logger.info("Aliyun STT 转写成功: %d 字节音频 → %d 字文字",
-                     len(audio_data), len(transcript))
+        logger.info("Aliyun STT 转写成功: %d 字节音频 → %d 字文字", len(audio_data), len(transcript))
         return {"success": True, "transcript": transcript}
 
     except Exception as e:
         logger.warning("Aliyun STT 失败: %s", e)
         return {"success": False, "error": str(e)}
-    finally:
-        # 立即删除临时文件，不做存储
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
 
 # ---------------------------------------------------------------------------
