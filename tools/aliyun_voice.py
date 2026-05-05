@@ -243,7 +243,10 @@ def aliyun_stt(audio_data: bytes, audio_format: str = "wav") -> Dict[str, Any]:
 
 
 def aliyun_tts(text: str) -> Dict[str, Any]:
-    """使用 Aliyun DashScope TTS 生成语音音频。
+    """使用 Aliyun DashScope CosyVoice TTS 生成语音音频。
+
+    通过 DashScope 原生 SDK（SpeechSynthesizer）调用，
+    不再使用 OpenAI-compatible 端点（该端点不支持 /v1/audio/speech）。
 
     Args:
         text: 要转换的文字（最长 4000 字符，超出自动截断）
@@ -261,31 +264,71 @@ def aliyun_tts(text: str) -> Dict[str, Any]:
     if not text or not text.strip():
         return {"success": False, "error": "文字为空"}
 
-    cfg = _get_aliyun_config()
-    model = cfg.get("tts_model", DEFAULT_TTS_MODEL)
-    voice = cfg.get("tts_voice", DEFAULT_TTS_VOICE)
-    base_url = cfg.get("base_url", DEFAULT_BASE_URL)
-    fmt = cfg.get("tts_format", DEFAULT_TTS_FORMAT)
+    # 合并 voice.aliyun 和 tts.aliyun 配置，tts 优先覆盖 voice
+    voice_cfg = _load_voice_config()
+    voice_aliyun = voice_cfg.get("aliyun", {})
+    try:
+        from hermes_cli.config import load_config
+        tts_cfg = load_config().get("tts", {})
+        tts_aliyun = tts_cfg.get("aliyun", {})
+    except Exception:
+        tts_aliyun = {}
+
+    merged = {}
+    merged.update(voice_aliyun)
+    merged.update(tts_aliyun)
+
+    model = merged.get("tts_model", DEFAULT_TTS_MODEL)
+    voice = merged.get("tts_voice", DEFAULT_TTS_VOICE)
+    fmt = merged.get("tts_format", DEFAULT_TTS_FORMAT)
 
     # 清理 markdown 并截断过长文本
     tts_text = _strip_markdown_for_tts(text)[:MAX_TTS_TEXT_LENGTH]
     if not tts_text:
         return {"success": False, "error": "清理后文字为空"}
 
-    try:
-        import openai
-        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+    # 格式映射：用户配置 → DashScope AudioFormat 枚举
+    from dashscope.audio.tts_v2 import AudioFormat
+    _FORMAT_MAP = {
+        "mp3": AudioFormat.MP3_22050HZ_MONO_256KBPS,
+        "wav": AudioFormat.WAV_22050HZ_MONO_16BIT,
+        "pcm": AudioFormat.PCM_22050HZ_MONO_16BIT,
+        "opus": AudioFormat.OGG_OPUS_24KHZ_MONO_32KBPS,
+    }
+    audio_format = _FORMAT_MAP.get(fmt, AudioFormat.MP3_22050HZ_MONO_256KBPS)
 
-        response = client.audio.speech.create(
+    try:
+        # DashScope SDK 在 import 时读取环境变量 DASHSCOPE_API_KEY，
+        # 同时设置 dashscope.api_key 属性确保已导入的模块也能感知
+        import os as _os
+        import dashscope
+        _old_env_key = _os.environ.get("DASHSCOPE_API_KEY", "")
+        _old_attr_key = dashscope.api_key
+        _os.environ["DASHSCOPE_API_KEY"] = api_key
+        dashscope.api_key = api_key
+
+        from dashscope.audio.tts_v2 import SpeechSynthesizer
+
+        synthesizer = SpeechSynthesizer(
             model=model,
             voice=voice,
-            input=tts_text,
-            response_format=fmt,
+            format=audio_format,
         )
 
-        audio_data = response.content
-        logger.info("Aliyun TTS 生成成功: %d 字文字 → %d 字节音频(%s)",
-                     len(tts_text), len(audio_data), fmt)
+        audio_data = synthesizer.call(tts_text)
+
+        # 恢复原始状态
+        if _old_env_key:
+            _os.environ["DASHSCOPE_API_KEY"] = _old_env_key
+        else:
+            _os.environ.pop("DASHSCOPE_API_KEY", None)
+        dashscope.api_key = _old_attr_key
+
+        if audio_data is None:
+            return {"success": False, "error": "DashScope TTS 返回空音频数据"}
+
+        logger.info("Aliyun TTS 生成成功: %d 字文字 → %d 字节音频(%s, model=%s, voice=%s)",
+                     len(tts_text), len(audio_data), fmt, model, voice)
         return {"success": True, "audio_data": audio_data, "format": fmt}
 
     except Exception as e:

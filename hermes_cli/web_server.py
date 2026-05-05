@@ -2401,11 +2401,23 @@ def _chat_get_agent(session_id: Optional[str] = None) -> Tuple[AIAgent, str]:
     model_cfg = config.get("model") or {}
     if isinstance(model_cfg, dict):
         model_name = model_cfg.get("default", "deepseek-v4-pro")
+        # 直接从 config 读取 provider/base_url/api_key，
+        # 不依赖 resolve_runtime_provider() 因为它要求 API key 在环境变量中
+        agent_provider = model_cfg.get("provider", "")
+        agent_base_url = model_cfg.get("base_url", "")
+        agent_api_key = model_cfg.get("api_key", "")
     else:
         model_name = str(model_cfg) if model_cfg else "deepseek-v4-pro"
+        agent_provider = ""
+        agent_base_url = ""
+        agent_api_key = ""
+
     if _chat_agent is None or session_id != _chat_session_id:
         _chat_agent = AIAgent(
             model=model_name,
+            provider=agent_provider or None,
+            base_url=agent_base_url or None,
+            api_key=agent_api_key or None,
             session_id=session_id,
             save_trajectories=True,
             session_db=_chat_get_db(),
@@ -2684,10 +2696,11 @@ async def voice_websocket_endpoint(ws: _WebSocket):
 
     async def _send_audio(audio_bytes: bytes):
         try:
-            _log.info("[voice] send audio bytes=%d", len(audio_bytes))
+            _log.info("[voice] send audio bytes=%d, ws_state=%s", len(audio_bytes), ws.client_state.name if hasattr(ws, "client_state") else "?")
             await ws.send_bytes(audio_bytes)
+            _log.info("[voice] send audio done bytes=%d", len(audio_bytes))
         except Exception as e:
-            _log.warning("[voice] send audio failed: %s", e)
+            _log.warning("[voice] send audio failed: %s, bytes=%d", e, len(audio_bytes))
 
     async def _set_status(status: str):
         await _send_json({"type": "status", "status": status})
@@ -2736,7 +2749,14 @@ async def voice_websocket_endpoint(ws: _WebSocket):
 
         try:
             if provider == "aliyun":
-                return _tts_aliyun(tts_text, _cfg)
+                result = _tts_aliyun(tts_text, _cfg)
+                if result.get("success"):
+                    _log.info("[voice] TTS aliyun result success=True bytes=%d",
+                              len(result.get("audio_data", b"")))
+                else:
+                    _log.info("[voice] TTS aliyun result success=False error=%s",
+                              result.get("error", ""))
+                return result
             elif provider == "openai":
                 return _tts_openai(tts_text, tts_config)
             elif provider == "elevenlabs":
@@ -2788,8 +2808,25 @@ async def voice_websocket_endpoint(ws: _WebSocket):
 
     def _tts_aliyun(tts_text: str, config: dict) -> dict:
         """阿里云 DashScope CosyVoice TTS。读 voice.aliyun.* 配置。"""
-        from tools.aliyun_voice import aliyun_tts
-        result = aliyun_tts(tts_text)
+        # 确保 DASHSCOPE_API_KEY 环境变量已设置，
+        # dashscope SDK 在 import 时读取环境变量，web server 进程中可能已被提前导入
+        import os as _os
+        tts_aliyun_cfg = config.get("tts", {}).get("aliyun", {})
+        voice_aliyun_cfg = config.get("voice", {}).get("aliyun", {})
+        _api_key = tts_aliyun_cfg.get("api_key") or voice_aliyun_cfg.get("api_key") or ""
+        _old_key = _os.environ.get("DASHSCOPE_API_KEY", "")
+        if _api_key:
+            _os.environ["DASHSCOPE_API_KEY"] = _api_key
+
+        try:
+            from tools.aliyun_voice import aliyun_tts
+            result = aliyun_tts(tts_text)
+        finally:
+            if _old_key:
+                _os.environ["DASHSCOPE_API_KEY"] = _old_key
+            else:
+                _os.environ.pop("DASHSCOPE_API_KEY", None)
+
         if result.get("success"):
             _log.info("[voice] TTS aliyun success bytes=%d", len(result.get("audio_data", b"")))
         else:
@@ -2900,10 +2937,22 @@ async def voice_websocket_endpoint(ws: _WebSocket):
         model_cfg = config.get("model") or {}
         if isinstance(model_cfg, dict):
             model_name = model_cfg.get("default", "deepseek-v4-pro")
+            # 直接从 config 读取 provider/base_url/api_key，
+            # 不依赖 resolve_runtime_provider() 因为它要求 API key 在环境变量中
+            agent_provider = model_cfg.get("provider", "")
+            agent_base_url = model_cfg.get("base_url", "")
+            agent_api_key = model_cfg.get("api_key", "")
         else:
             model_name = str(model_cfg) if model_cfg else "deepseek-v4-pro"
+            agent_provider = ""
+            agent_base_url = ""
+            agent_api_key = ""
+
         agent = AIAgent(
             model=model_name,
+            provider=agent_provider or None,
+            base_url=agent_base_url or None,
+            api_key=agent_api_key or None,
             session_id=sid,
             save_trajectories=False,
             session_db=db,
@@ -3143,11 +3192,14 @@ async def voice_websocket_endpoint(ws: _WebSocket):
                         continue  # 跳过此帧，不中断主循环
 
                     if vad_result == "speech_start":
-                        _log.info("[voice] VAD: speech_start")
+                        _log.info("[voice] VAD: speech_start, current_state=%s, has_agent_task=%s, has_interrupt=%s",
+                                  state,
+                                  session_data.get("agent_task") is not None,
+                                  session_data.get("interrupt_event") is not None)
                         await _send_json({"type": "vad", "status": "speech_start"})
                         # 如果当前在 SPEAKING 状态，打断
                         if state == "speaking":
-                            _log.info("[voice] 用户打断 AI 回复")
+                            _log.info("[voice] 用户打断 AI 回复 (speech_start while speaking)")
                             interrupt_event = session_data.get("interrupt_event")
                             if interrupt_event:
                                 interrupt_event.set()
